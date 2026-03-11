@@ -81,13 +81,23 @@ The loop continues until the Evaluator decides `DONE` or the iteration limit is 
 
 ## Installation
 
+### via npm (recommended)
+
+```bash
+npm install -g agentforge-multi
+```
+
+Dependencies (`rich`, `prompt_toolkit`) are installed automatically via postinstall.
+
+### via git
+
 ```bash
 git clone https://github.com/<your-username>/AgentForge.git
 cd AgentForge
 bash install.sh
 ```
 
-Or manually:
+### manually
 
 ```bash
 cp agentforge ~/.local/bin/agentforge
