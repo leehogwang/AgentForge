@@ -420,11 +420,9 @@ def parse_decision(text: str) -> tuple[str, str]:
 # ── TUI ───────────────────────────────────────────────────────────────────────
 
 def make_layout() -> Layout:
-    try:
-        term_h = os.get_terminal_size().lines
-    except OSError:
-        term_h = 40
-    body_size = max(10, term_h - 5)  # header(3) + 여백(2)
+    import shutil
+    term_h = shutil.get_terminal_size(fallback=(80, 40)).lines
+    body_size = max(10, term_h - 8)  # header(3) + 여백(5)
 
     layout = Layout()
     layout.split(
@@ -854,11 +852,8 @@ def main():
     layout["header"].update(render_header("", 0, max_iter, "idle"))
     layout["worker"].update(render_worker_panel(deque(), 0, "idle", [], False))
     layout["evaluator"].update(render_evaluator_panel([], 0, "idle", False))
-
-    live = Live(layout, refresh_per_second=8, screen=False)
-    live.start()
-    time.sleep(0.3)
-    live.stop()
+    with Live(layout, refresh_per_second=8, screen=False) as live:
+        time.sleep(0.3)
 
     # ── REPL 루프 ─────────────────────────────────────────────────────
     status = auth_status()
@@ -882,7 +877,6 @@ def main():
                 "agentforge auth login 으로 나중에 로그인할 수 있습니다.[/dim]"
             )
 
-    console.print()
     console.print("[dim]명령을 입력하세요. /plan <목표> | /exit[/dim]")
 
     _completer = SlashCompleter()
