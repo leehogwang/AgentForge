@@ -7,7 +7,7 @@ Usage:
 
 Slash commands:
   /exit      종료
-  /plan <목표>  계획 수립 후 실행
+  /resume    마지막 세션 재개
   <일반 텍스트>  Worker에게 즉시 전달 (목표 설정)
 """
 
@@ -18,7 +18,6 @@ import re
 import select
 import subprocess
 import sys
-import tempfile
 import termios
 import textwrap
 import threading
@@ -26,6 +25,8 @@ import time
 import tty
 from collections import deque
 from pathlib import Path
+
+import requests as _requests
 
 from rich.console import Console
 from rich.layout import Layout
@@ -45,6 +46,9 @@ from prompt_toolkit.formatted_text import HTML
 CODEX_BIN = Path.home() / ".npm-global" / "bin" / "codex"
 DEFAULT_MAX_ITER = 5000
 WORKER_BUF_LINES = 60
+DEFAULT_WORKER_MODEL = "gpt-5.4"
+DEFAULT_EVAL_MODEL = "gpt-5.1-codex-mini"
+CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07')
 DECISION_RE = re.compile(r'^(DONE|IMPROVE|REDIRECT)(?::\s*(.*))?$', re.I | re.M)
 NOISE_RE = re.compile(r'^\s*([\-─═\s]+)?$')
@@ -52,12 +56,151 @@ NOISE_RE = re.compile(r'^\s*([\-─═\s]+)?$')
 console = Console()
 _last_session: dict | None = None        # {goal, history, eval_history, workdir}
 _interrupt_event = threading.Event()     # ESC 감지 플래그
-_current_proc: subprocess.Popen | None = None  # 현재 실행 중인 subprocess
+
+# ── ChatGPT backend API ────────────────────────────────────────────────────────
+
+def _get_auth_headers() -> dict:
+    """~/.codex/auth.json 에서 Bearer 헤더 + ChatGPT-Account-Id 반환."""
+    auth_file = Path.home() / ".codex" / "auth.json"
+    data = json.loads(auth_file.read_text())
+    token = data["tokens"]["access_token"]
+    account_id = data["tokens"].get("account_id", "")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "ChatGPT-Account-Id": account_id,
+    }
+
+
+WORKER_TOOLS = [
+    {
+        "type": "function",
+        "name": "shell",
+        "description": "Execute a shell command. Use for running scripts, compiling, testing, installing packages, etc.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Shell command to run"},
+            },
+            "required": ["command"],
+        },
+        "strict": False,
+    },
+    {
+        "type": "function",
+        "name": "read_file",
+        "description": "Read the full contents of a file",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+            },
+            "required": ["path"],
+        },
+        "strict": False,
+    },
+    {
+        "type": "function",
+        "name": "write_file",
+        "description": "Write content to a file (creates or overwrites)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+        },
+        "strict": False,
+    },
+    {
+        "type": "function",
+        "name": "list_files",
+        "description": "List files and directories at a path",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+            },
+            "required": ["path"],
+        },
+        "strict": False,
+    },
+]
+
+
+def _stream_response(payload: dict) -> list:
+    """
+    ChatGPT backend-api/codex/responses 스트리밍 호출.
+    SSE 이벤트를 파싱하여 (event_type, data_dict) 리스트 반환.
+    _interrupt_event가 set되면 조기 종료.
+    """
+    headers = _get_auth_headers()
+    events = []
+    try:
+        r = _requests.post(
+            CHATGPT_RESPONSES_URL, headers=headers,
+            json=payload, stream=True, timeout=300,
+        )
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if _interrupt_event.is_set():
+                break
+            if not line:
+                continue
+            decoded = line.decode("utf-8", errors="replace")
+            if decoded.startswith("data: "):
+                try:
+                    ev = json.loads(decoded[6:])
+                    events.append(ev)
+                except Exception:
+                    pass
+    except Exception as e:
+        events.append({"type": "_error", "message": str(e)})
+    return events
+
+
+def _execute_tool(name: str, args: dict, workdir: str) -> str:
+    """Worker 도구 실행."""
+    try:
+        if name == "shell":
+            result = subprocess.run(
+                args["command"], shell=True,
+                capture_output=True, text=True, errors='replace',
+                cwd=workdir, timeout=120,
+            )
+            out = (result.stdout + result.stderr).strip()
+            return (out[:6000] if out else "(no output)") + (
+                f"\n[exit code: {result.returncode}]" if result.returncode != 0 else ""
+            )
+        elif name == "read_file":
+            path = Path(args["path"])
+            if not path.is_absolute():
+                path = Path(workdir) / path
+            return path.read_text(errors='replace')[:10000]
+        elif name == "write_file":
+            path = Path(args["path"])
+            if not path.is_absolute():
+                path = Path(workdir) / path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(args["content"])
+            return f"Written: {path}"
+        elif name == "list_files":
+            path = Path(args["path"])
+            if not path.is_absolute():
+                path = Path(workdir) / path
+            items = sorted(path.iterdir())
+            return "\n".join(
+                ("dir  " if p.is_dir() else "file ") + p.name for p in items
+            )
+        else:
+            return f"Unknown tool: {name}"
+    except Exception as e:
+        return f"Error: {e}"
 
 # ── Slash command autocomplete ────────────────────────────────────────────────
 
 SLASH_COMMANDS = [
-    ("/plan",   "계획을 수립한 뒤 Worker + Evaluator 루프 실행"),
     ("/resume", "마지막 세션을 이어서 실행"),
     ("/exit",   "agentforge 종료"),
 ]
@@ -153,24 +296,6 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
     Do NOT write anything before the decision keyword.
 """).strip()
 
-PLAN_SYSTEM = textwrap.dedent("""\
-    You are a planning agent. DO NOT write any code or modify any files.
-    Your job is to create a detailed implementation plan in Korean.
-
-    If anything is unclear, list your questions first in this format:
-    질문:
-    1. ...
-    2. ...
-
-    If everything is clear, output the plan directly:
-    계획:
-    - ...
-    - ...
-
-    Be specific and actionable. No code, only plan.
-""").strip()
-
-
 def build_worker_prompt(goal: str, history: list) -> str:
     lines = [f"GOAL: {goal}", ""]
     if not history:
@@ -207,18 +332,6 @@ def build_evaluator_prompt(goal: str, worker_output: str, iteration: int) -> str
         "Now evaluate. First line must be DONE, IMPROVE: ..., or REDIRECT: ...",
     ])
 
-
-def build_plan_prompt(goal: str, qa_history: list) -> str:
-    lines = [PLAN_SYSTEM, "", f"목표: {goal}"]
-    if qa_history:
-        lines.append("")
-        lines.append("이전 질의응답:")
-        for qa in qa_history:
-            lines.append(f"  Q: {qa['q']}")
-            lines.append(f"  A: {qa['a']}")
-    lines.append("")
-    lines.append("위 정보를 바탕으로 계획을 수립하거나 질문을 출력하라.")
-    return "\n".join(lines)
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -290,17 +403,21 @@ def cmd_auth_status():
 # ── ESC Listener ──────────────────────────────────────────────────────────────
 
 def _esc_listener(stop: threading.Event):
-    """데몬 스레드: ESC 키 감지 시 _interrupt_event 설정."""
+    """데몬 스레드: /dev/tty 직접 열어 ESC 키 감지."""
     try:
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
+        tty_fd = os.open('/dev/tty', os.O_RDONLY)
     except Exception:
         return
     try:
-        tty.setcbreak(fd)
+        old = termios.tcgetattr(tty_fd)
+        new = list(old)
+        new[3] &= ~(termios.ICANON | termios.ECHO)
+        new[6][termios.VMIN] = 1
+        new[6][termios.VTIME] = 0
+        termios.tcsetattr(tty_fd, termios.TCSANOW, new)
         while not stop.is_set():
-            if select.select([sys.stdin], [], [], 0.1)[0]:
-                ch = os.read(fd, 1)
+            if select.select([tty_fd], [], [], 0.1)[0]:
+                ch = os.read(tty_fd, 1)
                 if ch == b'\x1b':
                     _interrupt_event.set()
                     break
@@ -308,103 +425,132 @@ def _esc_listener(stop: threading.Event):
         pass
     finally:
         try:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            termios.tcsetattr(tty_fd, termios.TCSADRAIN, old)
+            os.close(tty_fd)
         except Exception:
             pass
 
 
 # ── Agent Runners ─────────────────────────────────────────────────────────────
 
-def _run_codex(cmd: list, workdir: str, buf: deque | None,
-               status_ref: list | None) -> tuple[str, int]:
-    """codex exec 실행. buf가 있으면 stdout 스트리밍. 최종 메시지 반환."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-        out_file = f.name
-
-    full_cmd = cmd + ["-o", out_file]
-    try:
-        if buf is not None:
-            global _current_proc
-            if status_ref:
-                status_ref[0] = "running"
-            proc = subprocess.Popen(
-                full_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, errors='replace',
-            )
-            _current_proc = proc
-            prev_line = ""
-            for raw in proc.stdout:
-                clean = strip_ansi(raw).rstrip()
-                if clean and not NOISE_RE.match(clean) and clean != prev_line:
-                    buf.append(colorize_line(clean))
-                    prev_line = clean
-            proc.wait()
-            _current_proc = None
-            rc = proc.returncode
-            if status_ref:
-                status_ref[0] = "done"
-        else:
-            proc = subprocess.run(
-                full_cmd, capture_output=True, text=True, errors='replace',
-            )
-            rc = proc.returncode
-    except Exception as e:
-        if buf is not None:
-            buf.append(f"[red][ERROR] {e}[/red]")
-        if status_ref:
-            status_ref[0] = "error"
-        rc = 1
-
-    last_msg = ""
-    try:
-        last_msg = strip_ansi(Path(out_file).read_text()).strip()
-    except Exception:
-        if buf:
-            last_msg = strip_ansi("\n".join(list(buf)[-10:]))
-    finally:
-        try:
-            Path(out_file).unlink()
-        except Exception:
-            pass
-
-    return last_msg, rc
-
-
 def run_worker(prompt: str, workdir: str, model: str | None,
                buf: deque, status_ref: list) -> tuple[str, int]:
-    cmd = [
-        str(CODEX_BIN), "exec",
-        "--full-auto", "--skip-git-repo-check", "--color", "never",
-        "-C", workdir,
-    ]
-    if model:
-        cmd += ["-m", model]
-    cmd.append(prompt)
-    return _run_codex(cmd, workdir, buf, status_ref)
+    """Worker: ChatGPT backend Responses API 직접 호출 + 도구 실행 루프."""
+    model = model or DEFAULT_WORKER_MODEL
+    status_ref[0] = "running"
+
+    # 입력 히스토리 (user msg + function_call + function_call_output 누적)
+    input_history: list[dict] = [{"role": "user", "content": prompt}]
+    all_text_parts: list[str] = []
+    line_buf = ""
+
+    def _flush_line(text: str):
+        nonlocal line_buf
+        line_buf += text
+        while '\n' in line_buf:
+            ln, line_buf = line_buf.split('\n', 1)
+            if ln.strip() and not NOISE_RE.match(ln):
+                buf.append(colorize_line(ln))
+
+    for _round in range(30):
+        if _interrupt_event.is_set():
+            break
+
+        payload = {
+            "model": model,
+            "instructions": WORKER_SYSTEM,
+            "input": input_history,
+            "tools": WORKER_TOOLS,
+            "store": False,
+            "stream": True,
+        }
+
+        events = _stream_response(payload)
+
+        # 에러 처리
+        for ev in events:
+            if ev["type"] == "_error":
+                buf.append(f"[red]API 오류: {ev['message']}[/red]")
+                status_ref[0] = "error"
+                if line_buf.strip():
+                    buf.append(colorize_line(line_buf))
+                return "\n".join(all_text_parts), 1
+
+        # 텍스트 + 도구 호출 수집
+        text_parts: list[str] = []
+        fc_items: list[dict] = []   # {call_id, name, arguments}
+
+        for ev in events:
+            t = ev["type"]
+            if t == "response.output_text.delta":
+                delta = ev.get("delta", "")
+                text_parts.append(delta)
+                _flush_line(delta)
+            elif t == "response.output_item.done" and ev.get("item", {}).get("type") == "function_call":
+                item = ev["item"]
+                fc_items.append({
+                    "call_id": item["call_id"],
+                    "name":    item["name"],
+                    "arguments": item["arguments"],
+                })
+
+        round_text = "".join(text_parts)
+        if round_text:
+            all_text_parts.append(round_text)
+
+        # 도구 호출 없으면 종료
+        if not fc_items:
+            break
+
+        # 도구 실행 및 히스토리에 추가
+        for fc in fc_items:
+            call_id = fc["call_id"]
+            name    = fc["name"]
+            raw_args = fc["arguments"]
+            try:
+                args = json.loads(raw_args)
+            except Exception:
+                args = {}
+
+            arg_preview = raw_args[:80]
+            buf.append(f"[cyan]▶ {name}({arg_preview})[/cyan]")
+            result = _execute_tool(name, args, workdir)
+            short = result[:300].replace('\n', ' ')
+            buf.append(f"[dim]{short}[/dim]")
+
+            # Responses API 형식 히스토리
+            input_history.append({"type": "function_call", "call_id": call_id,
+                                   "name": name, "arguments": raw_args})
+            input_history.append({"type": "function_call_output", "call_id": call_id,
+                                   "output": result})
+
+    # 잔여 line_buf flush
+    if line_buf.strip():
+        buf.append(colorize_line(line_buf))
+
+    status_ref[0] = "done"
+    return "\n".join(all_text_parts), 0
 
 
 def run_evaluator(prompt: str, workdir: str, model: str | None) -> tuple[str, int]:
-    cmd = [
-        str(CODEX_BIN), "exec",
-        "-s", "read-only", "--skip-git-repo-check", "--color", "never",
-        "-C", workdir,
-    ]
-    if model:
-        cmd += ["-m", model]
-    cmd.append(prompt)
-    return _run_codex(cmd, workdir, None, None)
-
-
-def run_plan_agent(prompt: str, workdir: str, model: str | None) -> tuple[str, int]:
-    cmd = [
-        str(CODEX_BIN), "exec",
-        "-s", "read-only", "--skip-git-repo-check", "--color", "never",
-        "-C", workdir,
-    ]
-    if model:
-        cmd += ["-m", model]
-    cmd.append(prompt)
-    return _run_codex(cmd, workdir, None, None)
+    """Evaluator: ChatGPT backend Responses API, 도구 없이 텍스트만."""
+    model = model or DEFAULT_EVAL_MODEL
+    payload = {
+        "model": model,
+        "instructions": EVALUATOR_SYSTEM,
+        "input": [{"role": "user", "content": prompt}],
+        "store": False,
+        "stream": True,
+    }
+    events = _stream_response(payload)
+    for ev in events:
+        if ev["type"] == "_error":
+            return f"[Evaluator error] {ev['message']}", 1
+    text = "".join(
+        ev.get("delta", "") for ev in events
+        if ev["type"] == "response.output_text.delta"
+    )
+    return text, 0
 
 
 def parse_decision(text: str) -> tuple[str, str]:
@@ -439,10 +585,9 @@ def make_layout() -> Layout:
 def render_header(goal: str, iteration: int, max_iter: int, phase: str) -> Panel:
     g = goal[:72] + "..." if len(goal) > 72 else goal
     status = {
-        "idle":      "[dim]명령 대기 중  /plan <목표>  또는  <목표> 입력[/dim]",
+        "idle":      "[dim]명령 대기 중  목표를 입력하거나  /resume  /exit[/dim]",
         "worker":    "⚙  [bold yellow on black] WORKER 실행 중 [/bold yellow on black]  [dim]Evaluator 대기[/dim]",
         "evaluator": "[dim]Worker 완료[/dim]  →  ◈  [bold magenta on black] EVALUATOR 평가 중 [/bold magenta on black]",
-        "planning":  "◑  [bold cyan on black] PLAN AGENT 실행 중 [/bold cyan on black]",
         "done":      "[bold green]✓  완료[/bold green]",
         "max":       "[bold red]⚠  최대 반복 도달[/bold red]",
     }.get(phase, phase)
@@ -528,8 +673,6 @@ def render_evaluator_panel(eval_history: list, iteration: int,
     if phase == "evaluator":
         lines.append(f"[magenta bold]── Iter {iteration} (평가 중) ──────────────[/magenta bold]")
         lines.append("[magenta blink]평가 중...[/magenta blink]")
-    elif phase == "planning":
-        lines.append("[cyan blink]계획 수립 중...[/cyan blink]")
     border = "green" if done else "magenta"
     is_active = (phase == "evaluator")
     if done:
@@ -544,82 +687,6 @@ def render_evaluator_panel(eval_history: list, iteration: int,
         title=title,
         border_style=border, box=box.ROUNDED, padding=(0, 1),
     )
-
-
-# ── Plan Mode ─────────────────────────────────────────────────────────────────
-
-def run_plan_mode(raw_goal: str, workdir: str, model: str | None,
-                  layout: Layout, live: Live) -> str | None:
-    """
-    /plan 모드: Plan Agent와 대화 후 최종 계획(목표 문자열)을 반환.
-    취소 시 None 반환.
-    """
-    goal = raw_goal.strip()
-    if not goal:
-        live.stop()
-        try:
-            goal = input("계획할 목표를 입력하세요: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return None
-        if not goal:
-            return None
-
-    qa_history = []
-
-    while True:
-        # Plan Agent 실행
-        layout["header"].update(render_header(goal, 0, 0, "planning"))
-        layout["worker"].update(render_worker_panel(deque(), 0, "idle", [], False))
-        layout["evaluator"].update(render_evaluator_panel([], 0, "planning", False))
-        live.start()
-        time.sleep(0.2)
-
-        plan_prompt = build_plan_prompt(goal, qa_history)
-        plan_output, _ = run_plan_agent(plan_prompt, workdir, model)
-
-        live.stop()
-        console.print()
-
-        # 질문이 있는지 확인
-        has_questions = '질문:' in plan_output or re.search(r'^\d+\.\s', plan_output, re.M)
-        has_plan = '계획:' in plan_output or re.search(r'^[-•]\s', plan_output, re.M)
-
-        console.print(Rule("[cyan]Plan Agent[/cyan]"))
-        console.print(plan_output)
-        console.print()
-
-        if has_questions and not has_plan:
-            # 질의응답
-            console.print("[dim]질문에 답변하세요 (취소: /cancel):[/dim]")
-            try:
-                answer = input("> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                return None
-            if answer.lower() in ('/cancel', '/exit'):
-                return None
-            qa_history.append({'q': plan_output, 'a': answer})
-            continue  # 다시 Plan Agent 실행
-
-        # 계획 수립 완료 → accept
-        console.print("[dim]이 계획으로 진행하시겠습니까? (y: 실행 / n: 다시 작성 / /cancel: 취소)[/dim]")
-        try:
-            ans = input("accept (y/n) > ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return None
-        if ans == 'y':
-            # 계획 내용을 목표로 삼아 반환
-            final_goal = f"{goal}\n\n[계획]\n{plan_output}"
-            return final_goal
-        elif ans in ('/cancel', '/exit'):
-            return None
-        # n → 다시 처음부터
-        qa_history.clear()
-        try:
-            new_goal = input("새 목표를 입력하거나 Enter로 기존 목표 유지: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return None
-        if new_goal:
-            goal = new_goal
 
 
 # ── Agent Loop ────────────────────────────────────────────────────────────────
@@ -676,9 +743,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
         t.start()
         while t.is_alive():
             if _interrupt_event.is_set():
-                if _current_proc:
-                    _current_proc.kill()
-                break
+                break  # worker 스레드는 _interrupt_event 확인 후 자체 중단
             refresh("worker", iteration)
             time.sleep(0.1)
         t.join()
@@ -840,10 +905,6 @@ def main():
             auth_parser.print_help()
         return
 
-    if not CODEX_BIN.exists():
-        console.print(f"[bold red]Error:[/bold red] codex not found at {CODEX_BIN}")
-        sys.exit(1)
-
     workdir = str(Path(args.dir).resolve())
     max_iter = args.max_iterations
 
@@ -877,7 +938,7 @@ def main():
                 "agentforge auth login 으로 나중에 로그인할 수 있습니다.[/dim]"
             )
 
-    console.print("[dim]명령을 입력하세요. /plan <목표> | /exit[/dim]")
+    console.print("[dim]명령을 입력하세요. /resume | /exit[/dim]")
 
     _completer = SlashCompleter()
 
@@ -905,37 +966,6 @@ def main():
             if cmd_name == 'exit':
                 console.print("[dim]종료합니다.[/dim]")
                 break
-
-            elif cmd_name == 'plan':
-                # Plan 모드
-                layout["header"].update(render_header(cmd_arg or "", 0, max_iter, "idle"))
-                layout["worker"].update(render_worker_panel(deque(), 0, "idle", [], False))
-                layout["evaluator"].update(render_evaluator_panel([], 0, "idle", False))
-
-                final_goal = run_plan_mode(cmd_arg, workdir, args.worker_model, layout, live)
-                if final_goal is None:
-                    console.print("[dim]계획 취소됨.[/dim]")
-                    continue
-                console.print()
-                console.print("[cyan]계획 확정. Worker + Evaluator 루프를 시작합니다...[/cyan]")
-                time.sleep(0.5)
-                # 새 layout/live 인스턴스로 루프 실행
-                layout2 = make_layout()
-                layout2["header"].update(render_header(final_goal, 0, max_iter, "idle"))
-                layout2["worker"].update(render_worker_panel(deque(), 0, "idle", [], False))
-                layout2["evaluator"].update(render_evaluator_panel([], 0, "idle", False))
-                live2 = Live(layout2, refresh_per_second=8, screen=False)
-                outcome = run_agent_loop(
-                    final_goal, workdir, args.worker_model, args.eval_model,
-                    max_iter, layout2, live2,
-                )
-                goal = final_goal
-                if outcome == 'interrupted':
-                    goal = _handle_interrupt(goal, workdir, args, max_iter)
-                elif outcome == 'max':
-                    console.print(f"[red]{max_iter}번 반복 후에도 완료되지 않았습니다.[/red]")
-                if outcome != 'interrupted':
-                    console.print("[dim]다음 명령을 입력하세요. /exit 로 종료.[/dim]")
 
             elif cmd_name == 'resume':
                 if not _last_session:
@@ -969,7 +999,7 @@ def main():
 
             else:
                 console.print(f"[red]알 수 없는 커맨드: /{cmd_name}[/red]")
-                console.print("[dim]사용 가능: /plan <목표>  /resume  /exit[/dim]")
+                console.print("[dim]사용 가능: /resume  /exit[/dim]")
 
         else:
             # 일반 텍스트 → 바로 Worker에게 목표로 전달
