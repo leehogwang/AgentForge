@@ -12,6 +12,7 @@ Slash commands:
 """
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -210,6 +211,72 @@ def build_plan_prompt(goal: str, qa_history: list) -> str:
     lines.append("")
     lines.append("위 정보를 바탕으로 계획을 수립하거나 질문을 출력하라.")
     return "\n".join(lines)
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+def auth_status() -> dict | None:
+    auth_file = Path.home() / ".codex" / "auth.json"
+    if not auth_file.exists():
+        return None
+    try:
+        data = json.loads(auth_file.read_text())
+    except Exception:
+        return None
+    return {
+        "mode":         data.get("auth_mode", "unknown"),
+        "account_id":   data.get("tokens", {}).get("account_id"),
+        "last_refresh": data.get("last_refresh"),
+        "has_token":    bool(data.get("tokens", {}).get("access_token")),
+    }
+
+
+def cmd_auth_login(device: bool = False):
+    console.print(Rule("[cyan]agentforge — 로그인[/cyan]"))
+    if not device and not sys.stdout.isatty():
+        console.print("[yellow]SSH 환경 감지됨. --device 플래그를 권장합니다.[/yellow]\n")
+    cmd = [str(CODEX_BIN), "login"]
+    if device:
+        cmd.append("--device-auth")
+    result = subprocess.run(cmd)
+    if result.returncode == 0:
+        status = auth_status()
+        console.print(f"\n[green]✓ 로그인 완료[/green]")
+        if status and status["account_id"]:
+            console.print(f"  계정: {status['account_id']}")
+    else:
+        console.print("[red]✗ 로그인 실패[/red]")
+        sys.exit(1)
+
+
+def cmd_auth_logout():
+    console.print(Rule("[cyan]agentforge — 로그아웃[/cyan]"))
+    result = subprocess.run([str(CODEX_BIN), "logout"])
+    if result.returncode == 0:
+        console.print("[green]✓ 로그아웃 완료[/green]")
+    else:
+        console.print("[red]✗ 로그아웃 실패[/red]")
+
+
+def cmd_auth_status():
+    status = auth_status()
+    if not status or not status["has_token"]:
+        console.print(Panel(
+            "[red]로그인되지 않음[/red]\n\n"
+            "로그인:        [cyan]agentforge auth login[/cyan]\n"
+            "SSH 환경:     [cyan]agentforge auth login --device[/cyan]",
+            title="인증 상태", border_style="red",
+        ))
+        return
+    mode_label = {"chatgpt": "ChatGPT (Plus / Pro)"}.get(
+        status["mode"], status["mode"])
+    console.print(Panel(
+        f"[green]✓ 로그인됨[/green]\n\n"
+        f"방식:   [cyan]{mode_label}[/cyan]\n"
+        f"계정:   {status['account_id'] or '(알 수 없음)'}\n"
+        f"갱신:   {status['last_refresh'] or '(알 수 없음)'}",
+        title="인증 상태", border_style="green",
+    ))
 
 
 # ── Agent Runners ─────────────────────────────────────────────────────────────
@@ -582,6 +649,17 @@ def main():
         prog="agentforge",
         description="Worker + Evaluator 인터랙티브 멀티에이전트 CLI",
     )
+    sub = parser.add_subparsers(dest="subcommand")
+
+    auth_parser = sub.add_parser("auth", help="인증 관리 (ChatGPT Plus/Pro)")
+    auth_sub = auth_parser.add_subparsers(dest="auth_cmd")
+
+    login_parser = auth_sub.add_parser("login", help="로그인")
+    login_parser.add_argument("--device", action="store_true",
+        help="SSH/헤드리스 환경용 device auth 사용")
+    auth_sub.add_parser("logout", help="로그아웃")
+    auth_sub.add_parser("status", help="현재 인증 상태 확인")
+
     parser.add_argument("-d", "--dir", default=".", metavar="DIR",
                         help="작업 디렉토리 (기본: 현재 디렉토리)")
     parser.add_argument("--worker-model", default=None, metavar="MODEL",
@@ -591,6 +669,21 @@ def main():
     parser.add_argument("-n", "--max-iterations", type=int, default=DEFAULT_MAX_ITER,
                         metavar="N", help=f"최대 반복 횟수 (기본: {DEFAULT_MAX_ITER})")
     args = parser.parse_args()
+
+    # ── auth 서브커맨드 ────────────────────────────────────────────────
+    if args.subcommand == "auth":
+        if not CODEX_BIN.exists():
+            console.print(f"[red]Error: codex not found at {CODEX_BIN}[/red]")
+            sys.exit(1)
+        if args.auth_cmd == "login":
+            cmd_auth_login(device=getattr(args, "device", False))
+        elif args.auth_cmd == "logout":
+            cmd_auth_logout()
+        elif args.auth_cmd == "status":
+            cmd_auth_status()
+        else:
+            auth_parser.print_help()
+        return
 
     if not CODEX_BIN.exists():
         console.print(f"[bold red]Error:[/bold red] codex not found at {CODEX_BIN}")
@@ -611,6 +704,27 @@ def main():
     live.stop()
 
     # ── REPL 루프 ─────────────────────────────────────────────────────
+    status = auth_status()
+    if not status or not status["has_token"]:
+        console.print(
+            "[yellow]⚠  로그인되지 않았습니다.[/yellow] "
+            "지금 로그인하시겠습니까? ([bold]y[/bold]/n/device) ",
+            end="",
+        )
+        try:
+            ans = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans in ("y", ""):
+            cmd_auth_login(device=False)
+        elif ans == "device":
+            cmd_auth_login(device=True)
+        else:
+            console.print(
+                "[dim]로그인을 건너뜁니다. "
+                "agentforge auth login 으로 나중에 로그인할 수 있습니다.[/dim]"
+            )
+
     console.print()
     console.print("[dim]명령을 입력하세요. /plan <목표> | /exit[/dim]")
 
