@@ -1,0 +1,693 @@
+#!/usr/bin/env python3
+"""
+codex_multi — Worker + Evaluator 인터랙티브 멀티에이전트 CLI
+
+Usage:
+  codex_multi [-d DIR] [--worker-model M] [--eval-model M]
+
+Slash commands:
+  /exit      종료
+  /plan <목표>  계획 수립 후 실행
+  <일반 텍스트>  Worker에게 즉시 전달 (목표 설정)
+"""
+
+import argparse
+import re
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.text import Text
+from rich import box
+
+from prompt_toolkit import prompt as pt_prompt
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.styles import Style as PtStyle
+from prompt_toolkit.formatted_text import HTML
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+CODEX_BIN = Path.home() / ".npm-global" / "bin" / "codex"
+DEFAULT_MAX_ITER = 5000
+WORKER_BUF_LINES = 60
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07')
+DECISION_RE = re.compile(r'^(DONE|IMPROVE|REDIRECT)(?::\s*(.*))?$', re.I | re.M)
+NOISE_RE = re.compile(r'^\s*([\-─═\s]+)?$')
+
+console = Console()
+
+# ── Slash command autocomplete ────────────────────────────────────────────────
+
+SLASH_COMMANDS = [
+    ("/plan",  "계획을 수립한 뒤 Worker + Evaluator 루프 실행"),
+    ("/exit",  "codex_multi 종료"),
+]
+
+class SlashCompleter(Completer):
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if text.startswith('/'):
+            typed = text.lstrip('/')
+            for cmd, desc in SLASH_COMMANDS:
+                name = cmd.lstrip('/')
+                if name.startswith(typed):
+                    yield Completion(
+                        cmd,
+                        start_position=-len(text),
+                        display=HTML(f'<ansicyan>{cmd}</ansicyan>'),
+                        display_meta=HTML(f'<ansiwhite>{desc}</ansiwhite>'),
+                    )
+
+PROMPT_STYLE = PtStyle.from_dict({
+    'prompt':          'ansicyan bold',
+    'completion-menu.completion':          'bg:#1e1e2e #cdd6f4',
+    'completion-menu.completion.current':  'bg:#313244 #cba6f7 bold',
+    'completion-menu.meta.completion':          'bg:#1e1e2e #6c7086',
+    'completion-menu.meta.completion.current':  'bg:#313244 #bac2de',
+})
+
+# ── Output colorizer ──────────────────────────────────────────────────────────
+
+def colorize_line(line: str) -> str:
+    """Worker 출력 라인에 문맥 기반 색상 적용."""
+    s = line.strip()
+    if not s:
+        return ""
+    # 주석 → 초록
+    if s.startswith(('#', '//', '/*', '*')):
+        return f"[green]{line}[/green]"
+    # 에러/경고 → 빨강
+    if any(w in s.lower() for w in ['error', 'traceback', 'exception', 'failed', 'fatal', 'errno']):
+        return f"[red]{line}[/red]"
+    # 성공 표시 → 초록
+    if any(w in s for w in ['✓', 'Created', 'Modified', 'written', 'Success', 'complete', 'Saved']):
+        return f"[green]{line}[/green]"
+    # 파일/작업 → 시안
+    if s.startswith(('>', 'Writing', 'Reading', 'Creating', 'Updating', 'Deleting', 'Running')):
+        return f"[cyan]{line}[/cyan]"
+    if s.startswith(('+', '-')) and len(s) > 1 and not s.startswith('--'):
+        return f"[cyan]{line}[/cyan]"
+    # 코드 키워드 → 밝은 흰색
+    if any(kw in s for kw in ['def ', 'class ', 'import ', 'from ', 'function ', 'const ', 'let ', 'var ', 'async ']):
+        return f"[bright_white]{line}[/bright_white]"
+    # 문자열 → 노란색
+    if (s.count('"') >= 2 or s.count("'") >= 2) and len(s) < 80:
+        return f"[yellow]{line}[/yellow]"
+    return line
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub('', text)
+
+
+# ── Prompt Templates ──────────────────────────────────────────────────────────
+
+WORKER_SYSTEM = textwrap.dedent("""\
+    You are a skilled software engineer executing a task step by step.
+    Your work will be reviewed by an evaluator agent.
+    Make concrete, real code changes — do not just describe what to do.
+    Be thorough and complete.
+""").strip()
+
+EVALUATOR_SYSTEM = textwrap.dedent("""\
+    You are a strict code reviewer. You do NOT modify any files.
+    Evaluate whether the goal has been achieved.
+
+    Respond with EXACTLY ONE of the following as your very first line:
+
+      DONE
+        (goal is fully and correctly achieved)
+
+      IMPROVE: <specific actionable feedback>
+        (progress made but refinements needed — same approach)
+
+      REDIRECT: <description of a completely different approach>
+        (current approach is fundamentally wrong)
+
+    When responding with DONE, after the keyword write a Korean summary in this EXACT format:
+
+    판단 이유: <목표 달성 근거 2~3문장>
+    결과물 위치: <생성/수정된 파일 경로 목록>
+    결과 요약: <무엇이 만들어졌는지 한 문장>
+
+    After IMPROVE or REDIRECT, write the feedback in Korean if possible.
+    Do NOT write anything before the decision keyword.
+""").strip()
+
+PLAN_SYSTEM = textwrap.dedent("""\
+    You are a planning agent. DO NOT write any code or modify any files.
+    Your job is to create a detailed implementation plan in Korean.
+
+    If anything is unclear, list your questions first in this format:
+    질문:
+    1. ...
+    2. ...
+
+    If everything is clear, output the plan directly:
+    계획:
+    - ...
+    - ...
+
+    Be specific and actionable. No code, only plan.
+""").strip()
+
+
+def build_worker_prompt(goal: str, history: list) -> str:
+    lines = [f"GOAL: {goal}", ""]
+    if not history:
+        lines += [WORKER_SYSTEM, "", "Begin working on the goal above. Make concrete changes now."]
+    else:
+        lines.append("ITERATION HISTORY:")
+        for h in history:
+            lines.append(f"  Iteration {h['iter']}:")
+            lines.append(f"    Your work: {h['worker_summary']}")
+            lines.append(f"    Evaluator: {h['decision']}" +
+                         (f" — {h['feedback']}" if h['feedback'] else ""))
+        lines.append("")
+        last = history[-1]
+        if last['decision'].upper() == 'IMPROVE':
+            lines.append(f"INSTRUCTION: Refine your previous work. Feedback: {last['feedback']}")
+        else:
+            lines.append(f"INSTRUCTION: Abandon previous approach. Try differently: {last['feedback']}")
+        lines.append("Make the changes now.")
+    return "\n".join(lines)
+
+
+def build_evaluator_prompt(goal: str, worker_output: str, iteration: int) -> str:
+    return "\n".join([
+        EVALUATOR_SYSTEM,
+        "",
+        f"ORIGINAL GOAL: {goal}",
+        f"CURRENT ITERATION: {iteration}",
+        "",
+        "WORKER OUTPUT FROM THIS ITERATION:",
+        "─" * 60,
+        worker_output[-3000:].strip(),
+        "─" * 60,
+        "",
+        "Now evaluate. First line must be DONE, IMPROVE: ..., or REDIRECT: ...",
+    ])
+
+
+def build_plan_prompt(goal: str, qa_history: list) -> str:
+    lines = [PLAN_SYSTEM, "", f"목표: {goal}"]
+    if qa_history:
+        lines.append("")
+        lines.append("이전 질의응답:")
+        for qa in qa_history:
+            lines.append(f"  Q: {qa['q']}")
+            lines.append(f"  A: {qa['a']}")
+    lines.append("")
+    lines.append("위 정보를 바탕으로 계획을 수립하거나 질문을 출력하라.")
+    return "\n".join(lines)
+
+
+# ── Agent Runners ─────────────────────────────────────────────────────────────
+
+def _run_codex(cmd: list, workdir: str, buf: deque | None,
+               status_ref: list | None) -> tuple[str, int]:
+    """codex exec 실행. buf가 있으면 stdout 스트리밍. 최종 메시지 반환."""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        out_file = f.name
+
+    full_cmd = cmd + ["-o", out_file]
+    try:
+        if buf is not None:
+            if status_ref:
+                status_ref[0] = "running"
+            proc = subprocess.Popen(
+                full_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors='replace',
+            )
+            prev_line = ""
+            for raw in proc.stdout:
+                clean = strip_ansi(raw).rstrip()
+                if clean and not NOISE_RE.match(clean) and clean != prev_line:
+                    buf.append(colorize_line(clean))
+                    prev_line = clean
+            proc.wait()
+            rc = proc.returncode
+            if status_ref:
+                status_ref[0] = "done"
+        else:
+            proc = subprocess.run(
+                full_cmd, capture_output=True, text=True, errors='replace',
+            )
+            rc = proc.returncode
+    except Exception as e:
+        if buf is not None:
+            buf.append(f"[red][ERROR] {e}[/red]")
+        if status_ref:
+            status_ref[0] = "error"
+        rc = 1
+
+    last_msg = ""
+    try:
+        last_msg = strip_ansi(Path(out_file).read_text()).strip()
+    except Exception:
+        if buf:
+            last_msg = strip_ansi("\n".join(list(buf)[-10:]))
+    finally:
+        try:
+            Path(out_file).unlink()
+        except Exception:
+            pass
+
+    return last_msg, rc
+
+
+def run_worker(prompt: str, workdir: str, model: str | None,
+               buf: deque, status_ref: list) -> tuple[str, int]:
+    cmd = [
+        str(CODEX_BIN), "exec",
+        "--full-auto", "--skip-git-repo-check", "--color", "never",
+        "-C", workdir,
+    ]
+    if model:
+        cmd += ["-m", model]
+    cmd.append(prompt)
+    return _run_codex(cmd, workdir, buf, status_ref)
+
+
+def run_evaluator(prompt: str, workdir: str, model: str | None) -> tuple[str, int]:
+    cmd = [
+        str(CODEX_BIN), "exec",
+        "-s", "read-only", "--skip-git-repo-check", "--color", "never",
+        "-C", workdir,
+    ]
+    if model:
+        cmd += ["-m", model]
+    cmd.append(prompt)
+    return _run_codex(cmd, workdir, None, None)
+
+
+def run_plan_agent(prompt: str, workdir: str, model: str | None) -> tuple[str, int]:
+    cmd = [
+        str(CODEX_BIN), "exec",
+        "-s", "read-only", "--skip-git-repo-check", "--color", "never",
+        "-C", workdir,
+    ]
+    if model:
+        cmd += ["-m", model]
+    cmd.append(prompt)
+    return _run_codex(cmd, workdir, None, None)
+
+
+def parse_decision(text: str) -> tuple[str, str]:
+    m = DECISION_RE.search(text)
+    if m:
+        return m.group(1).upper(), (m.group(2) or "").strip()
+    lower = text.lower()
+    if any(w in lower for w in ['task is complete', 'fully complete', 'goal achieved', 'all done']):
+        return 'DONE', ''
+    return 'IMPROVE', f"(parse failed) {text[:200]}"
+
+
+# ── TUI ───────────────────────────────────────────────────────────────────────
+
+def make_layout() -> Layout:
+    layout = Layout()
+    layout.split(
+        Layout(name="header", size=3),
+        Layout(name="body"),
+    )
+    layout["body"].split_row(
+        Layout(name="worker"),
+        Layout(name="evaluator"),
+    )
+    return layout
+
+
+def render_header(goal: str, iteration: int, max_iter: int, phase: str) -> Panel:
+    g = goal[:72] + "..." if len(goal) > 72 else goal
+    status = {
+        "idle":      "[dim]명령 대기 중  /plan <목표>  또는  <목표> 입력[/dim]",
+        "worker":    "[yellow]⚙ Worker 실행 중...[/yellow]",
+        "evaluator": "[magenta]◈ Evaluator 평가 중...[/magenta]",
+        "planning":  "[cyan]◑ Plan Agent 실행 중...[/cyan]",
+        "done":      "[bold green]✓ 완료[/bold green]",
+        "max":       "[bold red]최대 반복 도달[/bold red]",
+    }.get(phase, phase)
+    iter_str = f"  Iter [bold]{iteration}[/bold]/{max_iter}" if iteration > 0 else ""
+    content = f"[bold cyan]Goal:[/bold cyan] {g}\n{status}{iter_str}"
+    return Panel(content, border_style="cyan", box=box.HEAVY_HEAD)
+
+
+def render_worker_panel(buf: deque, iteration: int, status: str,
+                        history: list, done: bool) -> Panel:
+    lines = []
+    for h in history[-3:]:   # 최근 3 iteration만 dim으로 표시
+        lines.append(f"[dim]── Iter {h['iter']} {'─'*30}[/dim]")
+        for l in h.get('worker_lines', [])[-5:]:
+            lines.append(f"[dim]{l}[/dim]")
+    if buf or status == "running":
+        if history:
+            lines.append(f"[yellow]── Iter {iteration} {'─'*30}[/yellow]")
+        for line in list(buf):
+            lines.append(line)
+        if status == "running":
+            lines.append("[yellow blink]▌[/yellow blink]")
+    border = "green" if done else "yellow"
+    icon = "✓" if done else "⚙"
+    content = "\n".join(lines) if lines else "[dim]명령을 입력하면 작업을 시작합니다.[/dim]"
+    return Panel(
+        Text.from_markup(content),
+        title=f"[{border}]{icon} WORKER AGENT[/{border}]",
+        border_style=border, box=box.ROUNDED, padding=(0, 1),
+    )
+
+
+def render_evaluator_panel(eval_history: list, iteration: int,
+                           phase: str, done: bool) -> Panel:
+    lines = []
+    for e in eval_history:
+        d, fb, fm = e['decision'], e['feedback'], e.get('full_msg', '')
+        lines.append(f"[dim]── Iter {e['iter']} {'─'*28}[/dim]")
+        if d == 'DONE':
+            lines.append("[bold green]✓ DONE[/bold green]")
+            # 한국어 요약 섹션 추출
+            for section in ['판단 이유', '결과물 위치', '결과 요약']:
+                m = re.search(rf'{section}:\s*(.+?)(?=\n판단|결과물|결과 요약|$)', fm, re.S)
+                if m:
+                    val = m.group(1).strip()[:120]
+                    lines.append(f"[dim]{section}:[/dim] [white]{val}[/white]")
+        elif d == 'IMPROVE':
+            lines.append("[bold yellow]IMPROVE[/bold yellow]")
+            for l in textwrap.wrap(fb, 42):
+                lines.append(f"[yellow]{l}[/yellow]")
+        elif d == 'REDIRECT':
+            lines.append("[bold red]REDIRECT[/bold red]")
+            for l in textwrap.wrap(fb, 42):
+                lines.append(f"[red]{l}[/red]")
+        lines.append("")
+    if phase == "evaluator":
+        lines.append(f"[magenta]── Iter {iteration} {'─'*28}[/magenta]")
+        lines.append("[magenta blink]평가 중...[/magenta blink]")
+    elif phase == "planning":
+        lines.append("[cyan blink]계획 수립 중...[/cyan blink]")
+    border = "green" if done else "magenta"
+    icon = "✓" if done else "◈"
+    content = "\n".join(lines) if lines else "[dim]Worker 완료 후 평가를 시작합니다.[/dim]"
+    return Panel(
+        Text.from_markup(content),
+        title=f"[{border}]{icon} EVALUATOR AGENT[/{border}]",
+        border_style=border, box=box.ROUNDED, padding=(0, 1),
+    )
+
+
+# ── Plan Mode ─────────────────────────────────────────────────────────────────
+
+def run_plan_mode(raw_goal: str, workdir: str, model: str | None,
+                  layout: Layout, live: Live) -> str | None:
+    """
+    /plan 모드: Plan Agent와 대화 후 최종 계획(목표 문자열)을 반환.
+    취소 시 None 반환.
+    """
+    goal = raw_goal.strip()
+    if not goal:
+        live.stop()
+        try:
+            goal = input("계획할 목표를 입력하세요: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not goal:
+            return None
+
+    qa_history = []
+
+    while True:
+        # Plan Agent 실행
+        layout["header"].update(render_header(goal, 0, 0, "planning"))
+        layout["worker"].update(render_worker_panel(deque(), 0, "idle", [], False))
+        layout["evaluator"].update(render_evaluator_panel([], 0, "planning", False))
+        live.start()
+        time.sleep(0.2)
+
+        plan_prompt = build_plan_prompt(goal, qa_history)
+        plan_output, _ = run_plan_agent(plan_prompt, workdir, model)
+
+        live.stop()
+        console.print()
+
+        # 질문이 있는지 확인
+        has_questions = '질문:' in plan_output or re.search(r'^\d+\.\s', plan_output, re.M)
+        has_plan = '계획:' in plan_output or re.search(r'^[-•]\s', plan_output, re.M)
+
+        console.print(Rule("[cyan]Plan Agent[/cyan]"))
+        console.print(plan_output)
+        console.print()
+
+        if has_questions and not has_plan:
+            # 질의응답
+            console.print("[dim]질문에 답변하세요 (취소: /cancel):[/dim]")
+            try:
+                answer = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if answer.lower() in ('/cancel', '/exit'):
+                return None
+            qa_history.append({'q': plan_output, 'a': answer})
+            continue  # 다시 Plan Agent 실행
+
+        # 계획 수립 완료 → accept
+        console.print("[dim]이 계획으로 진행하시겠습니까? (y: 실행 / n: 다시 작성 / /cancel: 취소)[/dim]")
+        try:
+            ans = input("accept (y/n) > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if ans == 'y':
+            # 계획 내용을 목표로 삼아 반환
+            final_goal = f"{goal}\n\n[계획]\n{plan_output}"
+            return final_goal
+        elif ans in ('/cancel', '/exit'):
+            return None
+        # n → 다시 처음부터
+        qa_history.clear()
+        try:
+            new_goal = input("새 목표를 입력하거나 Enter로 기존 목표 유지: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if new_goal:
+            goal = new_goal
+
+
+# ── Agent Loop ────────────────────────────────────────────────────────────────
+
+def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
+                   eval_model: str | None, max_iter: int,
+                   layout: Layout, live: Live) -> str:
+    """
+    Worker + Evaluator 반복 루프.
+    반환: 'done' | 'max'
+    """
+    history = []
+    eval_history = []
+    worker_buf = deque(maxlen=WORKER_BUF_LINES)
+    worker_status = ["idle"]
+    done = False
+
+    def refresh(phase: str, iteration: int):
+        layout["header"].update(render_header(goal, iteration, max_iter, phase))
+        layout["worker"].update(render_worker_panel(
+            worker_buf, iteration, worker_status[0], history, done))
+        layout["evaluator"].update(render_evaluator_panel(
+            eval_history, iteration, phase, done))
+
+    for iteration in range(1, max_iter + 1):
+        # ── Worker ──────────────────────────────────────────────────────
+        worker_buf.clear()
+        worker_status[0] = "running"
+        if not live._started:
+            live.start()
+        refresh("worker", iteration)
+
+        worker_prompt = build_worker_prompt(goal, history)
+        worker_result = [None, None]
+
+        def _worker():
+            worker_result[0], worker_result[1] = run_worker(
+                worker_prompt, workdir, worker_model, worker_buf, worker_status)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        while t.is_alive():
+            refresh("worker", iteration)
+            time.sleep(0.1)
+        t.join()
+        refresh("worker", iteration)
+
+        last_msg, _ = worker_result
+        worker_summary = (last_msg or "").replace('\n', ' ')[:300]
+        history.append({
+            'iter': iteration,
+            'worker_summary': worker_summary,
+            'worker_lines': list(worker_buf)[-12:],
+            'decision': '',
+            'feedback': '',
+        })
+
+        # ── Evaluator ────────────────────────────────────────────────────
+        refresh("evaluator", iteration)
+        eval_prompt = build_evaluator_prompt(goal, last_msg or "", iteration)
+        eval_msg, _ = run_evaluator(eval_prompt, workdir, eval_model)
+
+        decision, feedback = parse_decision(eval_msg)
+        history[-1]['decision'] = decision
+        history[-1]['feedback'] = feedback
+        eval_history.append({
+            'iter': iteration,
+            'decision': decision,
+            'feedback': feedback,
+            'full_msg': eval_msg,
+        })
+
+        if decision == 'DONE':
+            done = True
+            refresh("done", iteration)
+            time.sleep(0.8)
+            live.stop()
+
+            # 완료 요약 출력
+            console.print()
+            console.print(Rule(f"[bold green]✓ 완료 — {iteration}번 반복[/bold green]"))
+            console.print()
+            for section, color in [('판단 이유', 'white'), ('결과물 위치', 'cyan'), ('결과 요약', 'bright_white')]:
+                m = re.search(rf'{section}:\s*(.+?)(?=\n판단|결과물|결과 요약|\Z)', eval_msg, re.S)
+                if m:
+                    val = m.group(1).strip()
+                    console.print(f"[bold]{section}[/bold]")
+                    for line in val.splitlines():
+                        console.print(f"  [{color}]{line}[/{color}]")
+                    console.print()
+            return 'done'
+
+    live.stop()
+    return 'max'
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="codex_multi",
+        description="Worker + Evaluator 인터랙티브 멀티에이전트 CLI",
+    )
+    parser.add_argument("-d", "--dir", default=".", metavar="DIR",
+                        help="작업 디렉토리 (기본: 현재 디렉토리)")
+    parser.add_argument("--worker-model", default=None, metavar="MODEL",
+                        help="Worker 모델")
+    parser.add_argument("--eval-model", default=None, metavar="MODEL",
+                        help="Evaluator 모델")
+    parser.add_argument("-n", "--max-iterations", type=int, default=DEFAULT_MAX_ITER,
+                        metavar="N", help=f"최대 반복 횟수 (기본: {DEFAULT_MAX_ITER})")
+    args = parser.parse_args()
+
+    if not CODEX_BIN.exists():
+        console.print(f"[bold red]Error:[/bold red] codex not found at {CODEX_BIN}")
+        sys.exit(1)
+
+    workdir = str(Path(args.dir).resolve())
+    max_iter = args.max_iterations
+
+    # ── 초기 TUI 표시 ─────────────────────────────────────────────────
+    layout = make_layout()
+    layout["header"].update(render_header("", 0, max_iter, "idle"))
+    layout["worker"].update(render_worker_panel(deque(), 0, "idle", [], False))
+    layout["evaluator"].update(render_evaluator_panel([], 0, "idle", False))
+
+    live = Live(layout, refresh_per_second=8, screen=False)
+    live.start()
+    time.sleep(0.3)
+    live.stop()
+
+    # ── REPL 루프 ─────────────────────────────────────────────────────
+    console.print()
+    console.print("[dim]명령을 입력하세요. /plan <목표> | /exit[/dim]")
+
+    _completer = SlashCompleter()
+
+    while True:
+        try:
+            raw = pt_prompt(
+                HTML('<ansicyan><b>[codex_multi]</b></ansicyan> <ansiwhite>></ansiwhite> '),
+                completer=_completer,
+                complete_while_typing=True,
+                style=PROMPT_STYLE,
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]종료합니다.[/dim]")
+            break
+
+        if not raw:
+            continue
+
+        # 슬래시 커맨드 처리
+        if raw.startswith('/'):
+            token = raw[1:].split(None, 1)
+            cmd_name = token[0].lower() if token else ''
+            cmd_arg = token[1] if len(token) > 1 else ''
+
+            if cmd_name == 'exit':
+                console.print("[dim]종료합니다.[/dim]")
+                break
+
+            elif cmd_name == 'plan':
+                # Plan 모드
+                layout["header"].update(render_header(cmd_arg or "", 0, max_iter, "idle"))
+                layout["worker"].update(render_worker_panel(deque(), 0, "idle", [], False))
+                layout["evaluator"].update(render_evaluator_panel([], 0, "idle", False))
+
+                final_goal = run_plan_mode(cmd_arg, workdir, args.worker_model, layout, live)
+                if final_goal is None:
+                    console.print("[dim]계획 취소됨.[/dim]")
+                    continue
+                console.print()
+                console.print("[cyan]계획 확정. Worker + Evaluator 루프를 시작합니다...[/cyan]")
+                time.sleep(0.5)
+                # 새 layout/live 인스턴스로 루프 실행
+                layout2 = make_layout()
+                layout2["header"].update(render_header(final_goal, 0, max_iter, "idle"))
+                layout2["worker"].update(render_worker_panel(deque(), 0, "idle", [], False))
+                layout2["evaluator"].update(render_evaluator_panel([], 0, "idle", False))
+                live2 = Live(layout2, refresh_per_second=8, screen=False)
+                outcome = run_agent_loop(
+                    final_goal, workdir, args.worker_model, args.eval_model,
+                    max_iter, layout2, live2,
+                )
+                if outcome == 'max':
+                    console.print(f"[red]{max_iter}번 반복 후에도 완료되지 않았습니다.[/red]")
+                console.print("[dim]다음 명령을 입력하세요. /exit 로 종료.[/dim]")
+
+            else:
+                console.print(f"[red]알 수 없는 커맨드: /{cmd_name}[/red]")
+                console.print("[dim]사용 가능: /plan <목표>  /exit[/dim]")
+
+        else:
+            # 일반 텍스트 → 바로 Worker에게 목표로 전달
+            goal = raw
+            layout2 = make_layout()
+            layout2["header"].update(render_header(goal, 0, max_iter, "idle"))
+            layout2["worker"].update(render_worker_panel(deque(), 0, "idle", [], False))
+            layout2["evaluator"].update(render_evaluator_panel([], 0, "idle", False))
+            live2 = Live(layout2, refresh_per_second=8, screen=False)
+            outcome = run_agent_loop(
+                goal, workdir, args.worker_model, args.eval_model,
+                max_iter, layout2, live2,
+            )
+            if outcome == 'max':
+                console.print(f"[red]{max_iter}번 반복 후에도 완료되지 않았습니다.[/red]")
+            console.print("[dim]다음 명령을 입력하세요. /exit 로 종료.[/dim]")
+
+
+if __name__ == "__main__":
+    main()
