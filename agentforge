@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-codex_multi — Worker + Evaluator 인터랙티브 멀티에이전트 CLI
+agentforge — Worker + Evaluator 인터랙티브 멀티에이전트 CLI
 
 Usage:
-  codex_multi [-d DIR] [--worker-model M] [--eval-model M]
+  agentforge [-d DIR] [--worker-model M] [--eval-model M]
 
 Slash commands:
   /exit      종료
@@ -50,7 +50,7 @@ console = Console()
 
 SLASH_COMMANDS = [
     ("/plan",  "계획을 수립한 뒤 Worker + Evaluator 루프 실행"),
-    ("/exit",  "codex_multi 종료"),
+    ("/exit",  "agentforge 종료"),
 ]
 
 class SlashCompleter(Completer):
@@ -579,7 +579,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="codex_multi",
+        prog="agentforge",
         description="Worker + Evaluator 인터랙티브 멀티에이전트 CLI",
     )
     parser.add_argument("-d", "--dir", default=".", metavar="DIR",
@@ -619,7 +619,7 @@ def main():
     while True:
         try:
             raw = pt_prompt(
-                HTML('<ansicyan><b>[codex_multi]</b></ansicyan> <ansiwhite>></ansiwhite> '),
+                HTML('<ansicyan><b>[agentforge]</b></ansicyan> <ansiwhite>></ansiwhite> '),
                 completer=_completer,
                 complete_while_typing=True,
                 style=PROMPT_STYLE,
