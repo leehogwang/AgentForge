@@ -76,11 +76,16 @@ WORKER_TOOLS = [
     {
         "type": "function",
         "name": "shell",
-        "description": "Execute a shell command. Use for running scripts, compiling, testing, installing packages, etc.",
+        "description": (
+            "Execute a shell command. Default timeout is 120s. "
+            "For long-running training/monitoring commands, set timeout_seconds (max 7200). "
+            "For fire-and-forget background jobs use '... &' and a short follow-up tail command."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Shell command to run"},
+                "timeout_seconds": {"type": "integer", "description": "Max seconds to wait (default 120, max 7200)"},
             },
             "required": ["command"],
         },
@@ -129,14 +134,12 @@ WORKER_TOOLS = [
 ]
 
 
-def _stream_response(payload: dict) -> list:
+def _iter_events(payload: dict):
     """
     ChatGPT backend-api/codex/responses 스트리밍 호출.
-    SSE 이벤트를 파싱하여 (event_type, data_dict) 리스트 반환.
-    _interrupt_event가 set되면 조기 종료.
+    SSE 이벤트를 실시간으로 yield.  _interrupt_event가 set되면 조기 종료.
     """
     headers = _get_auth_headers()
-    events = []
     try:
         r = _requests.post(
             CHATGPT_RESPONSES_URL, headers=headers,
@@ -151,23 +154,22 @@ def _stream_response(payload: dict) -> list:
             decoded = line.decode("utf-8", errors="replace")
             if decoded.startswith("data: "):
                 try:
-                    ev = json.loads(decoded[6:])
-                    events.append(ev)
+                    yield json.loads(decoded[6:])
                 except Exception:
                     pass
     except Exception as e:
-        events.append({"type": "_error", "message": str(e)})
-    return events
+        yield {"type": "_error", "message": str(e)}
 
 
 def _execute_tool(name: str, args: dict, workdir: str) -> str:
     """Worker 도구 실행."""
     try:
         if name == "shell":
+            timeout = min(int(args.get("timeout_seconds", 120)), 7200)
             result = subprocess.run(
                 args["command"], shell=True,
                 capture_output=True, text=True, errors='replace',
-                cwd=workdir, timeout=120,
+                cwd=workdir, timeout=timeout,
             )
             out = (result.stdout + result.stderr).strip()
             return (out[:6000] if out else "(no output)") + (
@@ -465,34 +467,34 @@ def run_worker(prompt: str, workdir: str, model: str | None,
             "stream": True,
         }
 
-        events = _stream_response(payload)
+        # 실시간 스트리밍 처리
+        text_parts: list[str] = []
+        fc_items: list[dict] = []   # {call_id, name, arguments}
+        got_error = False
 
-        # 에러 처리
-        for ev in events:
-            if ev["type"] == "_error":
+        for ev in _iter_events(payload):
+            evtype = ev["type"]
+            if evtype == "_error":
                 buf.append(f"[red]API 오류: {ev['message']}[/red]")
                 status_ref[0] = "error"
                 if line_buf.strip():
                     buf.append(colorize_line(line_buf))
-                return "\n".join(all_text_parts), 1
-
-        # 텍스트 + 도구 호출 수집
-        text_parts: list[str] = []
-        fc_items: list[dict] = []   # {call_id, name, arguments}
-
-        for ev in events:
-            t = ev["type"]
-            if t == "response.output_text.delta":
+                got_error = True
+                break
+            elif evtype == "response.output_text.delta":
                 delta = ev.get("delta", "")
                 text_parts.append(delta)
                 _flush_line(delta)
-            elif t == "response.output_item.done" and ev.get("item", {}).get("type") == "function_call":
+            elif evtype == "response.output_item.done" and ev.get("item", {}).get("type") == "function_call":
                 item = ev["item"]
                 fc_items.append({
                     "call_id": item["call_id"],
                     "name":    item["name"],
                     "arguments": item["arguments"],
                 })
+
+        if got_error:
+            return "\n".join(all_text_parts), 1
 
         round_text = "".join(text_parts)
         if round_text:
@@ -542,15 +544,13 @@ def run_evaluator(prompt: str, workdir: str, model: str | None) -> tuple[str, in
         "store": False,
         "stream": True,
     }
-    events = _stream_response(payload)
-    for ev in events:
+    parts: list[str] = []
+    for ev in _iter_events(payload):
         if ev["type"] == "_error":
             return f"[Evaluator error] {ev['message']}", 1
-    text = "".join(
-        ev.get("delta", "") for ev in events
-        if ev["type"] == "response.output_text.delta"
-    )
-    return text, 0
+        if ev["type"] == "response.output_text.delta":
+            parts.append(ev.get("delta", ""))
+    return "".join(parts), 0
 
 
 def parse_decision(text: str) -> tuple[str, str]:
@@ -746,7 +746,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                 break  # worker 스레드는 _interrupt_event 확인 후 자체 중단
             refresh("worker", iteration)
             time.sleep(0.1)
-        t.join()
+        t.join(timeout=10)  # 최대 10초 대기 후 포기
         refresh("worker", iteration)
 
         # ESC로 중단된 경우
