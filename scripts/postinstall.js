@@ -33,19 +33,25 @@ const pyOk = check('Python 3.10+', () => {
   if (ver[0] < 3 || (ver[0] === 3 && ver[1] < 10)) throw new Error('version too low');
 });
 
-// 2. rich
-const richOk = check('Python package: rich', () => {
-  const r = spawnSync('python3', ['-c', 'import rich'], { encoding: 'utf8' });
-  if (r.status !== 0) throw new Error();
-});
+// 2. Python 패키지 목록
+//    import명과 pip 패키지명이 다른 경우(rank_bm25 / rank-bm25 등) 분리
+const pyPackages = [
+  { import: 'rich',           pip: 'rich' },
+  { import: 'prompt_toolkit', pip: 'prompt_toolkit' },
+  { import: 'requests',       pip: 'requests' },
+  { import: 'rank_bm25',      pip: 'rank-bm25' },  // RAG 검색
+  { import: 'tiktoken',       pip: 'tiktoken' },    // 토큰 수 계산
+];
 
-// 3. prompt_toolkit
-const ptOk = check('Python package: prompt_toolkit', () => {
-  const r = spawnSync('python3', ['-c', 'import prompt_toolkit'], { encoding: 'utf8' });
-  if (r.status !== 0) throw new Error();
-});
+const pkgResults = pyPackages.map(pkg => ({
+  ...pkg,
+  ok: check(`Python package: ${pkg.import}`, () => {
+    const r = spawnSync('python3', ['-c', `import ${pkg.import}`], { encoding: 'utf8' });
+    if (r.status !== 0) throw new Error();
+  }),
+}));
 
-// 4. codex CLI
+// 3. codex CLI
 const codexOk = check('codex CLI', () => {
   const r = spawnSync('which', ['codex'], { encoding: 'utf8' });
   if (r.status !== 0) throw new Error();
@@ -54,11 +60,9 @@ const codexOk = check('codex CLI', () => {
 console.log('─'.repeat(40));
 
 // 누락 패키지 자동 설치 시도
-if (!richOk || !ptOk) {
-  console.log(`\n${YELLOW}▶ Python 패키지 설치 중...${RESET}`);
-  const missing = [];
-  if (!richOk) missing.push('rich');
-  if (!ptOk)   missing.push('prompt_toolkit');
+const missing = pkgResults.filter(p => !p.ok).map(p => p.pip);
+if (missing.length > 0) {
+  console.log(`\n${YELLOW}▶ Python 패키지 설치 중: ${missing.join(', ')}${RESET}`);
   try {
     execSync(`pip install ${missing.join(' ')} --quiet`, { stdio: 'inherit' });
     console.log(`${GREEN}  ✓ 설치 완료: ${missing.join(', ')}${RESET}`);
