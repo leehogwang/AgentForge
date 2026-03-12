@@ -59,19 +59,36 @@ _last_session: dict | None = None        # {goal, history, eval_history, workdir
 _interrupt_event = threading.Event()     # ESC 감지 플래그
 _current_response = None                 # 현재 스트리밍 HTTP 응답 (즉시 끊기용)
 
+# HTTP 세션 — TCP+TLS 연결 재사용으로 매 호출 수십~수백 ms 절감
+_session = _requests.Session()
+_session.headers.update({"Content-Type": "application/json"})
+
+# 인증 헤더 캐시 — auth.json mtime이 바뀔 때만 재읽기
+_auth_cache: dict | None = None
+_auth_mtime: float = 0.0
+
 # ── ChatGPT backend API ────────────────────────────────────────────────────────
 
 def _get_auth_headers() -> dict:
-    """~/.codex/auth.json 에서 Bearer 헤더 + ChatGPT-Account-Id 반환."""
+    """~/.codex/auth.json 에서 Bearer 헤더 반환. mtime 기반 캐싱."""
+    global _auth_cache, _auth_mtime
     auth_file = Path.home() / ".codex" / "auth.json"
+    try:
+        mtime = auth_file.stat().st_mtime
+    except OSError:
+        return {}
+    if _auth_cache is not None and mtime == _auth_mtime:
+        return _auth_cache
     data = json.loads(auth_file.read_text())
     token = data["tokens"]["access_token"]
     account_id = data["tokens"].get("account_id", "")
-    return {
+    _auth_cache = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "ChatGPT-Account-Id": account_id,
     }
+    _auth_mtime = mtime
+    return _auth_cache
 
 
 WORKER_TOOLS = [
@@ -164,7 +181,7 @@ def _iter_events(payload: dict):
     global _current_response
     headers = _get_auth_headers()
     try:
-        r = _requests.post(
+        r = _session.post(
             CHATGPT_RESPONSES_URL, headers=headers,
             json=payload, stream=True, timeout=300,
         )
@@ -184,6 +201,7 @@ def _iter_events(payload: dict):
                     except Exception:
                         pass
         finally:
+            r.close()   # GeneratorExit(gen.close()) 시에도 HTTP 연결 즉시 반환
             _current_response = None
     except Exception as e:
         _current_response = None
@@ -228,7 +246,7 @@ def _execute_tool(name: str, args: dict, workdir: str) -> str:
             query = args["query"]
             brave_key = os.environ.get("BRAVE_API_KEY")
             if brave_key:
-                r = _requests.get(
+                r = _session.get(
                     "https://api.search.brave.com/res/v1/web/search",
                     params={"q": query, "count": 10},
                     headers={"Accept": "application/json",
@@ -242,7 +260,7 @@ def _execute_tool(name: str, args: dict, workdir: str) -> str:
                     for i, it in enumerate(items[:8])
                 ) or "(결과 없음)"
             else:
-                r = _requests.get(
+                r = _session.get(
                     "https://html.duckduckgo.com/html/",
                     params={"q": query},
                     headers={"User-Agent": "Mozilla/5.0"},
@@ -262,7 +280,7 @@ def _execute_tool(name: str, args: dict, workdir: str) -> str:
                 return "\n".join(lines) or "(결과 없음)"
         elif name == "fetch_url":
             url = args["url"]
-            r = _requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            r = _session.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             text = re.sub(r'<[^>]+>', ' ', r.text)
             text = re.sub(r'\s+', ' ', text).strip()
             return text[:8000]
@@ -400,6 +418,110 @@ RESEARCH_EVALUATOR_SYSTEM = textwrap.dedent("""\
 """).strip()
 
 
+TOKEN_COMPRESS_THRESHOLD = 100_000  # 프롬프트 추정 토큰이 이 수를 넘으면 압축
+HISTORY_KEEP_RECENT = 4             # 압축 후 보존할 최근 항목 수 (상세 내용 유지)
+
+
+def _estimate_tokens(text: str) -> int:
+    """토큰 수 추정. tiktoken 있으면 정확하게, 없으면 글자 수 기반 근사."""
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except Exception:
+        # 영문 ~4자/토큰, 한글 ~1.5자/토큰 혼합 근사 → 3자/토큰
+        return len(text) // 3
+
+# ── History Compression ───────────────────────────────────────────────────────
+
+COMPRESSOR_SYSTEM = textwrap.dedent("""\
+    You are a concise summarizer for an AI agent's work log.
+    Given a list of past iterations (what the agent tried and what the evaluator said),
+    produce a compact summary that preserves:
+    - Every approach that was tried (even failed ones)
+    - Why each approach was rejected or approved
+    - The current state of the work (what exists, what doesn't)
+    - Any important file paths or technical details
+
+    Write in plain English. Be dense but complete. Max 400 words.
+    Do NOT omit failed approaches — the agent must not repeat them.
+""").strip()
+
+
+def _call_compressor(entries: list[dict], goal: str, model: str | None) -> str:
+    """과거 history entries를 LLM으로 요약. 실패 시 원본 한 줄 요약 반환."""
+    lines = [f"GOAL: {goal}", "", "ITERATIONS TO SUMMARIZE:"]
+    for h in entries:
+        lines.append(f"  Iter {h['iter']}: [{h['decision']}] {h.get('feedback','')[:200]}")
+        ws = h.get('worker_summary', '')
+        if ws:
+            lines.append(f"    Worker did: {ws[:200]}")
+    prompt_text = "\n".join(lines)
+
+    model = model or DEFAULT_EVAL_MODEL
+    payload = {
+        "model": model,
+        "instructions": COMPRESSOR_SYSTEM,
+        "input": [{"role": "user", "content": prompt_text}],
+        "store": False,
+        "stream": True,
+    }
+    parts: list[str] = []
+    gen = _iter_events(payload)
+    try:
+        for ev in gen:
+            if ev["type"] == "response.output_text.delta":
+                parts.append(ev.get("delta", ""))
+    finally:
+        gen.close()
+    result = "".join(parts).strip()
+    if not result:
+        # 폴백: 원본 한 줄 목록
+        result = "\n".join(
+            f"Iter {h['iter']} [{h['decision']}]: {h.get('feedback','')[:100]}"
+            for h in entries
+        )
+    return result
+
+
+def compress_history(history: list, goal: str, model: str | None) -> list:
+    """
+    history가 COMPRESS_THRESHOLD를 넘으면 오래된 항목을 LLM 요약으로 교체.
+    최근 KEEP_RECENT 항목은 보존.
+    반환: 새 history 리스트 (압축 entry + 최근 항목)
+    """
+    # 이미 압축된 summary entry가 있으면 그것도 포함해 재압축 대상 선정
+    to_compress = history[:-HISTORY_KEEP_RECENT]
+    keep = history[-HISTORY_KEEP_RECENT:]
+
+    # summary entry는 그대로, 일반 entry만 압축
+    prev_summary_text = ""
+    normal_entries = []
+    for h in to_compress:
+        if h.get('type') == 'compressed_summary':
+            prev_summary_text = h['content']
+        else:
+            normal_entries.append(h)
+
+    if not normal_entries:
+        return history  # 압축할 게 없음
+
+    new_text = _call_compressor(normal_entries, goal, model)
+    if prev_summary_text:
+        combined = prev_summary_text + "\n\n--- Additional history ---\n" + new_text
+    else:
+        combined = new_text
+
+    first_iter = normal_entries[0]['iter']
+    last_iter  = normal_entries[-1]['iter']
+    summary_entry = {
+        'type': 'compressed_summary',
+        'covers': f"{first_iter}–{last_iter}",
+        'content': combined,
+    }
+    return [summary_entry] + keep
+
+
 def build_worker_prompt(goal: str, history: list) -> str:
     lines = [f"GOAL: {goal}", ""]
     if not history:
@@ -407,16 +529,24 @@ def build_worker_prompt(goal: str, history: list) -> str:
     else:
         lines.append("ITERATION HISTORY:")
         for h in history:
-            lines.append(f"  Iteration {h['iter']}:")
-            lines.append(f"    Your work: {h['worker_summary']}")
-            lines.append(f"    Evaluator: {h['decision']}" +
-                         (f" — {h['feedback']}" if h['feedback'] else ""))
+            if h.get('type') == 'compressed_summary':
+                lines.append(f"  [COMPRESSED SUMMARY — Iter {h['covers']}]")
+                for ln in h['content'].splitlines():
+                    lines.append(f"    {ln}")
+                lines.append("  ──────────────────────────────────────")
+            else:
+                lines.append(f"  Iteration {h['iter']}:")
+                lines.append(f"    Your work: {h['worker_summary']}")
+                lines.append(f"    Evaluator: {h['decision']}" +
+                             (f" — {h['feedback']}" if h['feedback'] else ""))
         lines.append("")
-        last = history[-1]
-        if last['decision'].upper() == 'IMPROVE':
-            lines.append(f"INSTRUCTION: Refine your previous work. Feedback: {last['feedback']}")
-        else:
-            lines.append(f"INSTRUCTION: Abandon previous approach. Try differently: {last['feedback']}")
+        # 마지막 실제 iteration entry 찾기
+        last = next((h for h in reversed(history) if h.get('type') != 'compressed_summary'), None)
+        if last:
+            if last['decision'].upper() == 'IMPROVE':
+                lines.append(f"INSTRUCTION: Refine your previous work. Feedback: {last['feedback']}")
+            else:
+                lines.append(f"INSTRUCTION: Abandon previous approach. Try differently: {last['feedback']}")
         lines.append("Make the changes now.")
     return "\n".join(lines)
 
@@ -654,7 +784,10 @@ def run_worker(prompt: str, workdir: str, model: str | None,
 
 def run_evaluator(prompt: str, workdir: str, model: str | None,
                   system_prompt: str | None = None) -> tuple[str, int]:
-    """Evaluator: ChatGPT backend Responses API, 도구 없이 텍스트만."""
+    """Evaluator: ChatGPT backend Responses API, 도구 없이 텍스트만.
+    IMPROVE/REDIRECT는 첫 번째 완성 라인에서 결정 → 스트림 조기 종료.
+    DONE은 한국어 요약까지 필요하므로 전체 수신.
+    """
     model = model or DEFAULT_EVAL_MODEL
     system_prompt = system_prompt or EVALUATOR_SYSTEM
     payload = {
@@ -665,11 +798,27 @@ def run_evaluator(prompt: str, workdir: str, model: str | None,
         "stream": True,
     }
     parts: list[str] = []
-    for ev in _iter_events(payload):
-        if ev["type"] == "_error":
-            return f"[Evaluator error] {ev['message']}", 1
-        if ev["type"] == "response.output_text.delta":
-            parts.append(ev.get("delta", ""))
+    accumulated = ""
+    early_decided = False
+    gen = _iter_events(payload)
+    try:
+        for ev in gen:
+            if ev["type"] == "_error":
+                return f"[Evaluator error] {ev['message']}", 1
+            if ev["type"] == "response.output_text.delta":
+                delta = ev.get("delta", "")
+                parts.append(delta)
+                if not early_decided:
+                    accumulated += delta
+                    # 첫 줄이 완성되면 결정 파싱 시도
+                    if '\n' in accumulated:
+                        first_line = accumulated.split('\n')[0].strip()
+                        m = DECISION_RE.match(first_line)
+                        if m and m.group(1).upper() in ('IMPROVE', 'REDIRECT'):
+                            early_decided = True
+                            break  # 한국어 요약 불필요 → 스트림 종료
+    finally:
+        gen.close()
     return "".join(parts), 0
 
 
@@ -884,6 +1033,10 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
     eval_sys     = RESEARCH_EVALUATOR_SYSTEM if mode == "research" else EVALUATOR_SYSTEM
     active_tools = RESEARCH_TOOLS if mode == "research" else WORKER_TOOLS
 
+    # 압축 상태 — 백그라운드 압축 스레드 결과 수신용
+    _compress_result: list[list] = []   # [new_history] 채워지면 완료
+    _compress_thread: threading.Thread | None = None
+
     # ESC 리스너 시작
     _interrupt_event.clear()
     _esc_stop = threading.Event()
@@ -968,6 +1121,28 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
             'feedback': feedback,
             'full_msg': eval_msg,
         })
+
+        # ── 이전 압축 결과 반영 ──────────────────────────────────────────
+        if _compress_thread and not _compress_thread.is_alive() and _compress_result:
+            history = _compress_result[0]
+            _compress_result.clear()
+            _compress_thread = None
+
+        # ── 프롬프트 토큰이 100k 초과 시 백그라운드 압축 시작 ────────────
+        prompt_tokens = _estimate_tokens(build_worker_prompt(goal, history))
+        if (prompt_tokens > TOKEN_COMPRESS_THRESHOLD
+                and (_compress_thread is None or not _compress_thread.is_alive())
+                and decision != 'DONE'):
+            _snap = list(history)  # 스냅샷 캡처
+            _res  = _compress_result
+
+            def _do_compress():
+                new_h = compress_history(_snap, goal, eval_model)
+                _res.clear()
+                _res.append(new_h)
+
+            _compress_thread = threading.Thread(target=_do_compress, daemon=True)
+            _compress_thread.start()
 
         if decision == 'DONE':
             done = True
