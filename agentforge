@@ -332,6 +332,7 @@ SLASH_COMMANDS = [
     ("/mode code",       "코딩 모드로 전환"),
     ("/mode research",   "연구 모드로 전환"),
     ("/eval-every <N>",  "N번마다 Evaluator 실행"),
+    ("/dir <path>",      "작업 디렉토리 변경"),
     ("/status",          "현재 설정 확인"),
     ("/help",            "커맨드 목록 표시"),
 ]
@@ -1586,6 +1587,20 @@ def main():
                     console.print(f"[cyan]Evaluator: {eval_every}번마다 실행[/cyan]")
                 except ValueError:
                     console.print("[red]숫자를 입력하세요. 예: /eval-every 3[/red]")
+
+            elif cmd_name == 'dir':
+                if not cmd_arg:
+                    console.print(f"현재 작업 디렉토리: [cyan]{workdir}[/cyan]")
+                    console.print("[dim]변경: /dir <경로>  예) /dir ~/AgentForge[/dim]")
+                else:
+                    new_dir = Path(cmd_arg).expanduser().resolve()
+                    if not new_dir.exists():
+                        console.print(f"[red]존재하지 않는 경로: {new_dir}[/red]")
+                    elif not new_dir.is_dir():
+                        console.print(f"[red]디렉토리가 아닙니다: {new_dir}[/red]")
+                    else:
+                        workdir = str(new_dir)
+                        console.print(f"[cyan]작업 디렉토리 변경: {workdir}[/cyan]")
 
             elif cmd_name == 'status':
                 console.print(f"모드: [cyan]{current_mode}[/cyan]  |  eval-every: [cyan]{eval_every}[/cyan]  |  dir: [cyan]{workdir}[/cyan]")
