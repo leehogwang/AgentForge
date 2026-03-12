@@ -689,6 +689,56 @@ def render_evaluator_panel(eval_history: list, iteration: int,
     )
 
 
+# ── tmux 자동 래핑 ────────────────────────────────────────────────────────────
+
+import shlex as _shlex
+import shutil as _shutil
+
+TMUX_SESSION = "agentforge"
+
+
+def _in_tmux() -> bool:
+    return bool(os.environ.get("TMUX"))
+
+
+def _tmux_session_exists() -> bool:
+    r = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION],
+                       capture_output=True)
+    return r.returncode == 0
+
+
+def _tmux_launch(extra_args: list):
+    """현재 프로세스를 tmux 세션 안의 agentforge로 교체."""
+    if _tmux_session_exists():
+        console.print(
+            f"[yellow]이미 실행 중인 agentforge 세션이 있습니다.[/yellow]\n"
+            f"  재접속:  [cyan]agentforge -r[/cyan]\n"
+            f"  새 세션: [cyan]agentforge --new-session[/cyan]"
+        )
+        sys.exit(0)
+
+    exe = _shutil.which("agentforge") or os.path.abspath(sys.argv[0])
+    cmd_str = " ".join(_shlex.quote(p) for p in [exe] + extra_args)
+    try:
+        os.execvp("tmux", ["tmux", "new-session", "-s", TMUX_SESSION, cmd_str])
+    except OSError:
+        pass  # tmux 실행 실패 → 그냥 일반 모드로 계속
+
+
+def _tmux_reconnect():
+    """기존 agentforge tmux 세션에 재접속."""
+    if not _shutil.which("tmux"):
+        console.print("[red]tmux가 설치되지 않았습니다.[/red]")
+        sys.exit(1)
+    if not _tmux_session_exists():
+        console.print(
+            "[yellow]실행 중인 agentforge 세션이 없습니다.[/yellow]\n"
+            "새 세션 시작: [cyan]agentforge[/cyan]"
+        )
+        sys.exit(1)
+    os.execvp("tmux", ["tmux", "attach-session", "-t", TMUX_SESSION])
+
+
 # ── Agent Loop ────────────────────────────────────────────────────────────────
 
 def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
@@ -865,6 +915,22 @@ def _handle_interrupt(goal: str, workdir: str, args, max_iter: int) -> str:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    # ── tmux 자동 래핑 ─────────────────────────────────────────────────
+    # -r / --reconnect: 기존 세션 재접속
+    if len(sys.argv) >= 2 and sys.argv[1] in ("-r", "--reconnect"):
+        _tmux_reconnect()
+        return
+
+    # --new-session: 기존 세션 무시하고 강제로 새 세션
+    force_new = len(sys.argv) >= 2 and sys.argv[1] == "--new-session"
+    extra_args = [a for a in sys.argv[1:] if a != "--new-session"]
+
+    if not _in_tmux() and _shutil.which("tmux"):
+        if force_new and _tmux_session_exists():
+            subprocess.run(["tmux", "kill-session", "-t", TMUX_SESSION])
+        _tmux_launch(extra_args)
+        # execvp 실패 또는 세션 이미 존재 시 여기까지 옴 → 일반 모드로 계속
+
     parser = argparse.ArgumentParser(
         prog="agentforge",
         description="Worker + Evaluator 인터랙티브 멀티에이전트 CLI",
