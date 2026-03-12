@@ -45,6 +45,8 @@ from prompt_toolkit.formatted_text import HTML
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 CODEX_BIN = Path.home() / ".npm-global" / "bin" / "codex"
+KNOWLEDGE_DIR  = Path.home() / ".agentforge" / "knowledge"   # 영구 지식 저장소 루트
+SESSION_FILE   = Path.home() / ".agentforge" / "last_session.json"  # 세션 영속화
 DEFAULT_MAX_ITER = 5000
 WORKER_BUF_LINES = 60
 DEFAULT_WORKER_MODEL = "gpt-5.4"
@@ -57,6 +59,39 @@ NOISE_RE = re.compile(r'^\s*([\-─═\s]+)?$')
 console = Console()
 _last_session: dict | None = None        # {goal, history, eval_history, workdir}
 _interrupt_event = threading.Event()     # ESC 감지 플래그
+
+
+def _persist_session(session: dict) -> None:
+    """세션을 디스크에 저장. worker_lines는 TUI 표시용이라 제외."""
+    try:
+        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # worker_lines는 디스플레이 전용 → 저장 제외
+        history_slim = [
+            {k: v for k, v in h.items() if k != 'worker_lines'}
+            for h in session.get('history', [])
+        ]
+        data = {
+            **session,
+            'history': history_slim,
+            'saved_at': time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        SESSION_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+
+
+def _load_persisted_session() -> dict | None:
+    """디스크에서 세션 로드. 실패 시 None."""
+    try:
+        if not SESSION_FILE.exists():
+            return None
+        data = json.loads(SESSION_FILE.read_text())
+        # worker_lines 누락된 항목 복원
+        for h in data.get('history', []):
+            h.setdefault('worker_lines', [])
+        return data
+    except Exception:
+        return None
 _current_response = None                 # 현재 스트리밍 HTTP 응답 (즉시 끊기용)
 
 # HTTP 세션 — TCP+TLS 연결 재사용으로 매 호출 수십~수백 ms 절감
@@ -432,6 +467,110 @@ def _estimate_tokens(text: str) -> int:
         # 영문 ~4자/토큰, 한글 ~1.5자/토큰 혼합 근사 → 3자/토큰
         return len(text) // 3
 
+# ── Knowledge Store (RAG) ────────────────────────────────────────────────────
+
+def _goal_to_slug(goal: str) -> str:
+    """목표 문자열 → 파일시스템 안전 폴더명 (한글 보존)."""
+    slug = re.sub(r'[^\w가-힣\s]', '', goal)   # 특수문자 제거, 한글·영문·숫자 보존
+    slug = re.sub(r'\s+', '_', slug.strip())    # 공백 → 언더스코어
+    return slug[:72] or "unnamed"
+
+
+def _knowledge_path(goal: str) -> Path:
+    """목표별 지식 저장소 디렉토리 경로 반환 (없으면 생성)."""
+    p = KNOWLEDGE_DIR / _goal_to_slug(goal)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _save_attempt(goal: str, record: dict) -> None:
+    """시도 기록을 JSONL에 append (스레드 안전: Linux append는 원자적)."""
+    try:
+        path = _knowledge_path(goal) / "attempts.jsonl"
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass  # 저장 실패해도 에이전트 동작에 영향 없도록
+
+
+def _load_past_attempts(goal: str) -> list[dict]:
+    """과거 시도 기록 전체 로드."""
+    try:
+        path = _knowledge_path(goal) / "attempts.jsonl"
+        if not path.exists():
+            return []
+        records = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    records.append(json.loads(line))
+                except Exception:
+                    pass
+        return records
+    except Exception:
+        return []
+
+
+def _retrieve_relevant(query: str, attempts: list[dict], top_k: int = 6) -> list[dict]:
+    """
+    BM25로 query와 가장 관련 있는 과거 시도 검색.
+    rank_bm25 없으면 단어 overlap 기반 폴백.
+    """
+    if not attempts:
+        return []
+
+    def _text(a: dict) -> str:
+        return f"{a.get('feedback','')} {a.get('worker_summary','')} {a.get('decision','')}"
+
+    try:
+        from rank_bm25 import BM25Okapi
+        corpus = [_text(a).lower().split() for a in attempts]
+        bm25 = BM25Okapi(corpus)
+        scores = bm25.get_scores(query.lower().split())
+        top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+        return [attempts[i] for i in top_idx]
+    except Exception:
+        # 폴백: 단어 overlap 점수
+        q_words = set(query.lower().split())
+        scored = []
+        for a in attempts:
+            words = set(_text(a).lower().split())
+            scored.append((len(q_words & words), a))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [a for _, a in scored[:top_k]]
+
+
+def _build_rag_section(past_attempts: list[dict], current_context: str) -> str:
+    """
+    현재 상황과 관련된 과거 시도를 RAG로 검색하여
+    Worker 프롬프트에 삽입할 경고 섹션 생성.
+    """
+    if not past_attempts:
+        return ""
+
+    relevant = _retrieve_relevant(current_context, past_attempts, top_k=6)
+    if not relevant:
+        return ""
+
+    lines = [
+        "━" * 60,
+        "PAST ATTEMPTS FROM PREVIOUS SESSIONS — DO NOT REPEAT THESE:",
+    ]
+    for a in relevant:
+        decision = a.get("decision", "?")
+        feedback = a.get("feedback", "")[:200]
+        summary  = a.get("worker_summary", "")[:150]
+        ts       = a.get("timestamp", "")[:10]
+        badge    = {"DONE": "✓", "IMPROVE": "▲", "REDIRECT": "↩"}.get(decision, "?")
+        lines.append(f"  [{badge} {decision}] ({ts}) {feedback}")
+        if summary:
+            lines.append(f"    tried: {summary}")
+    lines.append("━" * 60)
+    return "\n".join(lines)
+
+
 # ── History Compression ───────────────────────────────────────────────────────
 
 COMPRESSOR_SYSTEM = textwrap.dedent("""\
@@ -522,8 +661,21 @@ def compress_history(history: list, goal: str, model: str | None) -> list:
     return [summary_entry] + keep
 
 
-def build_worker_prompt(goal: str, history: list) -> str:
+def build_worker_prompt(goal: str, history: list,
+                        past_attempts: list[dict] | None = None) -> str:
     lines = [f"GOAL: {goal}", ""]
+
+    # RAG 섹션: 현재 상황을 쿼리로 과거 시도 검색·삽입
+    if past_attempts:
+        current_ctx = " ".join(
+            f"{h.get('feedback','')} {h.get('worker_summary','')}"
+            for h in history[-3:] if h.get('type') != 'compressed_summary'
+        ) or goal
+        rag = _build_rag_section(past_attempts, current_ctx)
+        if rag:
+            lines.append(rag)
+            lines.append("")
+
     if not history:
         lines += [WORKER_SYSTEM, "", "Begin working on the goal above. Make concrete changes now."]
     else:
@@ -1037,6 +1189,15 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
     _compress_result: list[list] = []   # [new_history] 채워지면 완료
     _compress_thread: threading.Thread | None = None
 
+    # ── 지식 저장소 로드 ─────────────────────────────────────────────────
+    past_attempts = _load_past_attempts(goal)
+    knowledge_dir = _knowledge_path(goal)
+    if past_attempts:
+        console.print(
+            f"[dim]📚 지식 저장소 로드: {knowledge_dir.name}/ "
+            f"({len(past_attempts)}개 과거 시도)[/dim]"
+        )
+
     # ESC 리스너 시작
     _interrupt_event.clear()
     _esc_stop = threading.Event()
@@ -1062,7 +1223,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
             live.start()
         refresh("worker", iteration)
 
-        worker_prompt = build_worker_prompt(goal, history)
+        worker_prompt = build_worker_prompt(goal, history, past_attempts=past_attempts)
         worker_result = [None, None]
 
         def _worker():
@@ -1085,6 +1246,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
             live.stop()
             _last_session = {"goal": goal, "history": history,
                              "eval_history": eval_history, "workdir": workdir}
+            _persist_session(_last_session)
             return _finish('interrupted')
 
         last_msg, _ = worker_result
@@ -1102,6 +1264,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
             live.stop()
             _last_session = {"goal": goal, "history": history,
                              "eval_history": eval_history, "workdir": workdir}
+            _persist_session(_last_session)
             return _finish('interrupted')
 
         if iteration % eval_every == 0 or iteration == max_iter:
@@ -1122,6 +1285,18 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
             'full_msg': eval_msg,
         })
 
+        # ── 지식 저장소에 attempt 기록 ───────────────────────────────────
+        attempt_record = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "iter": iteration,
+            "decision": decision,
+            "feedback": feedback,
+            "worker_summary": worker_summary,
+            "goal": goal,
+        }
+        _save_attempt(goal, attempt_record)
+        past_attempts.append(attempt_record)  # 현재 세션 내 즉시 반영
+
         # ── 이전 압축 결과 반영 ──────────────────────────────────────────
         if _compress_thread and not _compress_thread.is_alive() and _compress_result:
             history = _compress_result[0]
@@ -1129,7 +1304,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
             _compress_thread = None
 
         # ── 프롬프트 토큰이 100k 초과 시 백그라운드 압축 시작 ────────────
-        prompt_tokens = _estimate_tokens(build_worker_prompt(goal, history))
+        prompt_tokens = _estimate_tokens(build_worker_prompt(goal, history, past_attempts=past_attempts))
         if (prompt_tokens > TOKEN_COMPRESS_THRESHOLD
                 and (_compress_thread is None or not _compress_thread.is_alive())
                 and decision != 'DONE'):
@@ -1153,6 +1328,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                 "goal": goal, "history": history,
                 "eval_history": eval_history, "workdir": workdir,
             }
+            _persist_session(_last_session)
 
             # 완료 요약 출력
             console.print()
@@ -1173,6 +1349,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
         "goal": goal, "history": history,
         "eval_history": eval_history, "workdir": workdir,
     }
+    _persist_session(_last_session)
     return _finish('max')
 
 
@@ -1318,6 +1495,17 @@ def main():
     current_mode = args.mode
     eval_every   = args.eval_every
 
+    # 프로세스 시작 시 디스크에서 마지막 세션 복원
+    global _last_session
+    if _last_session is None:
+        _last_session = _load_persisted_session()
+        if _last_session:
+            saved_at = _last_session.get('saved_at', '알 수 없음')
+            console.print(
+                f"[dim]💾 이전 세션 복원됨: [cyan]{_last_session['goal'][:60]}[/cyan] "
+                f"({len(_last_session['history'])}회, {saved_at})[/dim]"
+            )
+
     console.print(f"[dim]명령을 입력하세요. /help 로 커맨드 목록 확인. 모드: {current_mode}[/dim]")
 
     _completer = SlashCompleter()
@@ -1353,9 +1541,17 @@ def main():
                     continue
                 s = _last_session
                 prev_iters = len(s["history"])
+                saved_at = s.get('saved_at', '알 수 없음')
                 console.print(Rule("[cyan]세션 재개[/cyan]"))
-                console.print(f"[dim]목표:[/dim] {s['goal'][:80]}")
-                console.print(f"[dim]이전 반복:[/dim] {prev_iters}회  →  이어서 실행")
+                console.print(f"[dim]목표:[/dim]    [white]{s['goal'][:80]}[/white]")
+                console.print(f"[dim]반복:[/dim]    {prev_iters}회 완료")
+                console.print(f"[dim]저장:[/dim]    {saved_at}")
+                last_decision = next(
+                    (h['decision'] for h in reversed(s['history'])
+                     if h.get('decision') and h.get('type') != 'compressed_summary'),
+                    '없음'
+                )
+                console.print(f"[dim]마지막 판정:[/dim] {last_decision}")
                 console.print()
                 layout2 = make_layout()
                 layout2["header"].update(render_header(s["goal"], prev_iters, max_iter, "idle"))
