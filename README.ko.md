@@ -176,6 +176,13 @@ AgentForge/
 
 ---
 
+
+## 구현 기능 전체 정리
+
+AgentForge에 현재 구현된 기능을 빠짐없이 정리한 문서는 아래를 참고하세요.
+
+- [FEATURES.ko.md](./FEATURES.ko.md) — RAG, research 모드, 세션 재개, 압축, 인증, tmux 흐름 포함 상세 기능 목록
+
 ## 참고
 
 - [OpenCode](https://opencode.ai) — 영감의 출처, 터미널 퍼스트 AI 코딩 에이전트

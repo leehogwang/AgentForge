@@ -18,7 +18,7 @@
   },
   "license": "MIT",
   "bin": {
-    "agentforge": "./agentforge"
+    "agentforge": "./bin/agentforge.js"
   },
   "scripts": {
     "postinstall": "node scripts/postinstall.js"
@@ -28,6 +28,7 @@
   },
   "files": [
     "agentforge",
+    "bin/",
     "scripts/",
     "README.md",
     "README.ko.md"
