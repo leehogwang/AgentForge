@@ -691,7 +691,13 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
     You are a strict code reviewer. You do NOT modify any files.
     Evaluate whether the goal has been achieved.
 
-    HARDCODING DETECTION (check this FIRST, before anything else):
+    EXPLORATION PHASE RULE (check this FIRST):
+    - If the worker's output consists primarily of file reads, directory listings,
+      shell inspections, or planning/analysis text — and NO actual code has been
+      written or trained yet — respond with CONTINUE (not REDIRECT or IMPROVE).
+    - "No code yet" is NOT hardcoding. Do not penalise exploration.
+
+    HARDCODING DETECTION (only when actual code or trained output exists):
     - Actively scan the worker's code for: hardcoded magic values, special-cased
       conditions like `if x == <specific_value>`, lookup tables that memorize
       expected outputs, or any logic that only works for the exact example in the goal.
@@ -701,6 +707,9 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
     - Only proceed to evaluate correctness after confirming there is no hardcoding.
 
     Respond with EXACTLY ONE of the following as your very first line:
+
+      CONTINUE
+        (worker is still in exploration/analysis/planning phase — no code yet)
 
       DONE
         (goal is fully and correctly achieved, with no hardcoding)
@@ -1060,13 +1069,21 @@ DUAL_EVALUATOR_SYSTEM = textwrap.dedent("""\
     You are a strict code reviewer for ONE specific sub-task.
     You have NO knowledge of the other worker. Evaluate ONLY your worker's approach.
 
-    HARDCODING DETECTION (check this FIRST):
+    EXPLORATION PHASE RULE (check this FIRST):
+    - If the worker's output is mainly file reads, directory listings, shell
+      inspections, or planning text — and NO actual code has been written or
+      model trained yet — respond with CONTINUE.
+    - "No code yet" is NOT hardcoding. Do not penalise exploration.
+
+    HARDCODING DETECTION (only when actual code or trained output exists):
     - Scan for hardcoded magic values, special-cased conditions, or logic that only
       works for the exact example in the goal.
     - If found: REDIRECT with "하드코딩 감지: <위치> — 루트 원인을 수정하라."
     - A solution that passes by memorizing the example is NOT DONE — it is REDIRECT.
 
     Respond with EXACTLY ONE first-line decision:
+      CONTINUE
+        (worker is still exploring/reading files/planning — no code written yet)
       DONE
       IMPROVE: <specific actionable feedback>
       REDIRECT: <different approach, OR hardcoding detected>
