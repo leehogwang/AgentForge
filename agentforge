@@ -1660,12 +1660,13 @@ def make_layout() -> Layout:
 def make_dual_layout() -> Layout:
     import shutil
     term_h = shutil.get_terminal_size(fallback=(80, 40)).lines
-    body_size = max(10, term_h - 8)  # header(3) + summary_bar(3) + margin(2)
+    body_size = max(10, term_h - 11)  # header(3) + summary_bar(3) + cmd_bar(3) + margin(2)
     layout = Layout()
     layout.split(
         Layout(name="header",      size=3),
         Layout(name="summary_bar", size=3),
         Layout(name="body",        size=body_size),
+        Layout(name="cmd_bar",     size=3),
     )
     layout["body"].split_row(
         Layout(name="worker1"),
@@ -1684,6 +1685,38 @@ def render_summary_bar(task_a: str, task_b: str, s1: str, s2: str) -> Panel:
     c2 = "cyan bold"   if s2 == "running" else "dim"
     content = f"[{c1}]⚙ W1:[/{c1}] [dim]{a}[/dim]\n[{c2}]⚙ W2:[/{c2}] [dim]{b}[/dim]"
     return Panel(content, border_style="dim", box=box.SIMPLE, padding=(0, 1))
+
+
+def render_cmd_bar(buf1, buf2, status1: str, status2: str) -> Panel:
+    """하단 상태바: 각 Worker가 현재 실행 중인 마지막 도구 호출 표시."""
+    import re as _re
+    _markup_re = _re.compile(r'\[/?[a-zA-Z#][^\]]*\]')
+
+    def last_cmd(buf, status: str) -> str:
+        # 버퍼에서 마지막 ▶ 도구 호출 라인 추출
+        for line in reversed(list(buf)):
+            clean = _markup_re.sub('', line).strip()
+            if clean.startswith('▶'):
+                # 터미널 너비에 맞게 자름
+                import shutil as _sh
+                w = max(30, _sh.get_terminal_size(fallback=(80, 40)).columns // 2 - 12)
+                return clean[:w] + ("…" if len(clean) > w else "")
+        if status == "running":
+            return "[dim]실행 준비 중...[/dim]"
+        if status == "done":
+            return "[green dim]완료[/green dim]"
+        return "[dim]대기 중[/dim]"
+
+    c1 = "yellow" if status1 == "running" else "dim"
+    c2 = "cyan"   if status2 == "running" else "dim"
+    line1 = last_cmd(buf1, status1)
+    line2 = last_cmd(buf2, status2)
+    content = (
+        f"[{c1}]W1[/{c1}] [dim]▶[/dim] {line1}\n"
+        f"[{c2}]W2[/{c2}] [dim]▶[/dim] {line2}"
+    )
+    return Panel(content, title="[dim]현재 실행 중[/dim]",
+                 border_style="dim", box=box.SIMPLE, padding=(0, 1))
 
 
 def render_header(goal: str, iteration: int, max_iter: int, phase: str) -> Panel:
@@ -2623,6 +2656,9 @@ def run_dual_agent_loop(
         layout["evaluator"].update(
             render_dual_evaluator_panel(eval_history1, eval_history2, iteration, phase, done1, done2)
         )
+        layout["cmd_bar"].update(
+            render_cmd_bar(buf1, buf2, status1[0], status2[0])
+        )
 
     # 이전 레이아웃 잔상 제거 후 즉시 듀얼 레이아웃 시작
     console.clear()
@@ -3101,6 +3137,7 @@ def main():
                     layout2["evaluator"].update(render_dual_evaluator_panel(
                         s.get("eval_history1", []), s.get("eval_history2", []),
                         prev_iters, "idle", False, False))
+                    layout2["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
                     live2 = Live(layout2, refresh_per_second=8, screen=False)
                     outcome = run_dual_agent_loop(
                         s["goal"], s.get("task_a", s["goal"]), s.get("task_b", s["goal"]),
@@ -3154,6 +3191,7 @@ def main():
                         _il["worker1"].update(render_worker_panel(deque(), 0, "idle", [], False, label="WORKER 1"))
                         _il["worker2"].update(render_worker_panel(deque(), 0, "idle", [], False, label="WORKER 2"))
                         _il["evaluator"].update(render_dual_evaluator_panel([], [], 0, "idle", False, False))
+                        _il["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
                     else:
                         _il = make_layout()
                         _il["header"].update(render_header("", 0, max_iter, "idle"))
@@ -3256,6 +3294,7 @@ def main():
                 layout2["worker1"].update(render_worker_panel(deque(), 0, "idle", [], False, label="WORKER 1"))
                 layout2["worker2"].update(render_worker_panel(deque(), 0, "idle", [], False, label="WORKER 2"))
                 layout2["evaluator"].update(render_dual_evaluator_panel([], [], 0, "idle", False, False))
+                layout2["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
                 live2 = Live(layout2, refresh_per_second=8, screen=False)
                 outcome = run_dual_agent_loop(
                     goal, task_a, task_b, workdir,
