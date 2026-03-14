@@ -40,6 +40,225 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.styles import Style as PtStyle
 from prompt_toolkit.formatted_text import HTML
 
+# ── MCP Client ────────────────────────────────────────────────────────────────
+
+class _MCPClient:
+    """
+    HTTP(Streamable) 기반 MCP 서버 클라이언트.
+    서버 프로세스를 띄우고 POST /mcp 로 JSON-RPC 2.0 통신.
+    """
+    def __init__(self, name: str, command: list[str],
+                 port: int = 0, env: dict | None = None):
+        self.name = name
+        self.command = command
+        self.env = env
+        self.port = port or self._find_free_port()
+        self._proc: subprocess.Popen | None = None
+        self._req_id = 0
+        self._session_id: str | None = None
+        self.tools: list[dict] = []
+
+    @staticmethod
+    def _find_free_port() -> int:
+        import socket
+        with socket.socket() as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+    def start(self) -> bool:
+        try:
+            _env = os.environ.copy()
+            if self.env:
+                _env.update(self.env)
+            cmd = self.command + ["--port", str(self.port)]
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, env=_env,
+            )
+            # 서버 준비 대기 (최대 8초)
+            base = f"http://localhost:{self.port}"
+            for _ in range(16):
+                time.sleep(0.5)
+                try:
+                    r = _requests.get(base, timeout=1)
+                    break
+                except Exception:
+                    continue
+            else:
+                return False
+            # initialize
+            resp = self._post("initialize", {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "agentforge", "version": "1.0"},
+            })
+            if resp is None:
+                return False
+            self._post_notify("notifications/initialized", {})
+            self.tools = self._discover_tools()
+            return True
+        except Exception:
+            self._proc = None
+            return False
+
+    def stop(self):
+        try:
+            if self._proc:
+                self._proc.terminate()
+                self._proc = None
+        except Exception:
+            pass
+
+    def _next_id(self) -> int:
+        self._req_id += 1
+        return self._req_id
+
+    def _post(self, method: str, params: dict) -> dict | None:
+        req_id = self._next_id()
+        body = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self._session_id:
+            headers["mcp-session-id"] = self._session_id
+        try:
+            r = _requests.post(
+                f"http://localhost:{self.port}/mcp",
+                json=body, headers=headers, timeout=60,
+            )
+            if "mcp-session-id" in r.headers:
+                self._session_id = r.headers["mcp-session-id"]
+            if r.status_code == 202:
+                return {}
+            ct = r.headers.get("content-type", "")
+            if "text/event-stream" in ct:
+                for line in r.text.splitlines():
+                    if line.startswith("data:"):
+                        data = line[5:].strip()
+                        if data and data != "[DONE]":
+                            return json.loads(data)
+                return None
+            return r.json()
+        except Exception:
+            return None
+
+    def _post_notify(self, method: str, params: dict):
+        body = {"jsonrpc": "2.0", "method": method, "params": params}
+        headers = {"Content-Type": "application/json"}
+        if self._session_id:
+            headers["mcp-session-id"] = self._session_id
+        try:
+            _requests.post(
+                f"http://localhost:{self.port}/mcp",
+                json=body, headers=headers, timeout=5,
+            )
+        except Exception:
+            pass
+
+    def _discover_tools(self) -> list[dict]:
+        resp = self._post("tools/list", {})
+        if not resp or "result" not in resp:
+            return []
+        tools = []
+        for t in resp["result"].get("tools", []):
+            tools.append({
+                "type": "function",
+                "name": f"mcp__{self.name}__{t['name']}",
+                "description": f"[MCP:{self.name}] {t.get('description', '')}",
+                "parameters": t.get("inputSchema", {"type": "object", "properties": {}}),
+                "strict": False,
+            })
+        return tools
+
+    def call(self, tool_name: str, args: dict) -> str:
+        actual = tool_name.removeprefix(f"mcp__{self.name}__")
+        resp = self._post("tools/call", {"name": actual, "arguments": args})
+        if not resp:
+            return f"[MCP:{self.name}] 응답 없음"
+        if "error" in resp:
+            return f"[MCP:{self.name}] 오류: {resp['error'].get('message', str(resp['error']))}"
+        content = resp.get("result", {}).get("content", [])
+        parts = []
+        for c in content:
+            if c.get("type") == "text":
+                parts.append(c.get("text", ""))
+            elif c.get("type") == "image":
+                parts.append(f"[image: {c.get('mimeType','?')}]")
+        return "\n".join(parts) if parts else str(resp.get("result", ""))
+
+
+# MCP 서버 레지스트리
+_MCP_REGISTRY: dict[str, _MCPClient] = {}
+
+def _mcp_init():
+    """
+    ~/.agentforge/mcp.json 에 정의된 서버들을 시작.
+    형식:
+    {
+      "servers": {
+        "playwright": {
+          "command": ["npx", "@playwright/mcp"],
+          "env": {}
+        }
+      }
+    }
+    """
+    global _MCP_REGISTRY
+    config_path = Path.home() / ".agentforge" / "mcp.json"
+
+    # 기본값: playwright + tavily 인터넷 검색
+    default_servers = {
+        "playwright": {
+            "command": ["npx", "@playwright/mcp", "--headless"],
+        },
+        "tavily": {
+            "command": ["npx", "tavily-mcp"],
+        },
+    }
+
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            servers = cfg.get("servers", default_servers)
+        except Exception:
+            servers = default_servers
+    else:
+        servers = default_servers
+
+    for name, conf in servers.items():
+        cmd = conf.get("command", [])
+        env = conf.get("env", None) or None
+        port = conf.get("port", 0)  # 0 = 자동 할당
+        client = _MCPClient(name, cmd, port=port, env=env)
+        if client.start():
+            _MCP_REGISTRY[name] = client
+
+def _mcp_stop_all():
+    for c in _MCP_REGISTRY.values():
+        c.stop()
+    _MCP_REGISTRY.clear()
+
+def _mcp_all_tools() -> list[dict]:
+    """모든 MCP 서버의 tool 목록을 합쳐서 반환."""
+    tools = []
+    for c in _MCP_REGISTRY.values():
+        tools.extend(c.tools)
+    return tools
+
+def _mcp_call(tool_name: str, args: dict) -> str | None:
+    """tool_name이 mcp__ 로 시작하면 해당 서버로 라우팅. 아니면 None."""
+    if not tool_name.startswith("mcp__"):
+        return None
+    parts = tool_name.split("__", 2)
+    if len(parts) < 2:
+        return f"잘못된 MCP 툴명: {tool_name}"
+    server_name = parts[1]
+    client = _MCP_REGISTRY.get(server_name)
+    if not client:
+        return f"[MCP] 서버 '{server_name}' 없음 (등록된 서버: {list(_MCP_REGISTRY.keys())})"
+    return client.call(tool_name, args)
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 CODEX_BIN = Path.home() / ".npm-global" / "bin" / "codex"
@@ -352,6 +571,11 @@ def _execute_tool(name: str, args: dict, workdir: str, worker_id: int = 0) -> st
     _t0 = time.time()
     # ── END DEBUG ────────────────────────────────────────────────────────────
     try:
+        # MCP 툴 라우팅
+        mcp_result = _mcp_call(name, args)
+        if mcp_result is not None:
+            return mcp_result
+
         if name == "shell":
             timeout = min(int(args.get("timeout_seconds", 120)), 7200)
             _env = os.environ.copy()
@@ -593,6 +817,9 @@ SLASH_COMMANDS = [
     ("/wandb",           "wandb 연동 상태 확인"),
     ("/report",          "현재 목표의 실험 리포트 출력"),
     ("/paper <url>",     "arXiv/논문 URL → 코드 자동 구현 목표 설정"),
+    ("/mcp list",        "연결된 MCP 서버 및 툴 목록"),
+    ("/mcp install <pkg>", "MCP 서버 설치 및 등록 (예: @playwright/mcp)"),
+    ("/mcp remove <name>", "MCP 서버 제거"),
     ("/help",            "커맨드 목록 표시"),
 ]
 
@@ -1818,7 +2045,7 @@ def run_worker(prompt: str, workdir: str, model: str | None,
         for fc in fc_items:
             result = results[fc["call_id"]]
             buf.append(f"[cyan]▶ {fc['name']}({fc['arguments'][:80]})[/cyan]")
-            buf.append(f"[dim]{result[:300].replace(chr(10), ' ')}[/dim]")
+            buf.append(f"[dim]{_osc8_linkify(result[:300].replace(chr(10), ' '))}[/dim]")
             input_history.append({"type": "function_call", "call_id": fc["call_id"],
                                    "name": fc["name"], "arguments": fc["arguments"]})
             input_history.append({"type": "function_call_output", "call_id": fc["call_id"],
@@ -2003,6 +2230,24 @@ _DECISION_BADGE = {
     "IMPROVE":  "[yellow]~[/yellow]",
     "REDIRECT": "[red]↩[/red]",
 }
+
+# 파일 경로 패턴 (절대경로 or ./상대경로)
+_PATH_RE = re.compile(r'(/[\w./\-_@:~가-힣]+(?:\.\w+)?|\.{1,2}/[\w./\-_@:~가-힣]+(?:\.\w+)?)')
+
+def _osc8_linkify(text: str) -> str:
+    """
+    텍스트 내 파일 경로를 OSC 8 하이퍼링크로 변환.
+    터미널에서 Ctrl+클릭 시 파일/폴더 열림 (VSCode, iTerm2 등 지원).
+    """
+    def replace(m: re.Match) -> str:
+        path = m.group(0)
+        p = Path(path).expanduser()
+        if p.exists():
+            uri = f"file://{p.resolve()}"
+            # OSC 8 이스케이프: \x1b]8;;URI\x1b\\TEXT\x1b]8;;\x1b\\
+            return f"\x1b]8;;{uri}\x1b\\{path}\x1b]8;;\x1b\\"
+        return path
+    return _PATH_RE.sub(replace, text)
 
 def render_worker_panel(buf: deque, iteration: int, status: str,
                         history: list, done: bool, label: str = "WORKER") -> Panel:
@@ -2571,7 +2816,8 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
     # 모드별 시스템 프롬프트 및 도구 선택
     worker_sys   = RESEARCH_WORKER_SYSTEM if mode == "research" else WORKER_SYSTEM
     eval_sys     = RESEARCH_EVALUATOR_SYSTEM if mode == "research" else EVALUATOR_SYSTEM
-    active_tools = RESEARCH_TOOLS if mode == "research" else WORKER_TOOLS
+    base_tools   = RESEARCH_TOOLS if mode == "research" else WORKER_TOOLS
+    active_tools = base_tools + _mcp_all_tools()
 
     # 압축 상태 — 백그라운드 압축 스레드 결과 수신용
     _compress_result: list[list] = []   # [new_history] 채워지면 완료
@@ -2905,7 +3151,7 @@ def run_dual_agent_loop(
     current_task_b = task_b
 
     worker_sys = RESEARCH_WORKER_SYSTEM if mode == "research" else WORKER_SYSTEM
-    active_tools = RESEARCH_TOOLS if mode == "research" else WORKER_TOOLS
+    active_tools = (RESEARCH_TOOLS if mode == "research" else WORKER_TOOLS) + _mcp_all_tools()
 
     past_attempts1 = _load_past_attempts(task_a)
     past_attempts2 = _load_past_attempts(task_b)
@@ -3383,6 +3629,14 @@ def main():
     eval_every   = args.eval_every
     # _last_session은 /resume 시점에 디스크에서 로드 (기본은 항상 새 시작)
 
+    # MCP 서버 초기화
+    _mcp_init()
+    if _MCP_REGISTRY:
+        tool_names = [t["name"] for c in _MCP_REGISTRY.values() for t in c.tools]
+        console.print(f"[dim]🔌 MCP 서버 {len(_MCP_REGISTRY)}개 연결됨 — 툴: {', '.join(tool_names[:6])}{'...' if len(tool_names)>6 else ''}[/dim]")
+    import atexit
+    atexit.register(_mcp_stop_all)
+
     console.print(f"[dim]명령을 입력하세요. /help 로 커맨드 목록 확인. 모드: {current_mode}[/dim]")
 
     _completer = SlashCompleter()
@@ -3584,6 +3838,73 @@ def main():
                             console.print(f"[red]{max_iter}번 반복 후에도 완료되지 않았습니다.[/red]")
                         if outcome != 'interrupted':
                             console.print("[dim]다음 명령을 입력하세요. /exit 로 종료.[/dim]")
+
+            elif cmd_name == 'mcp':
+                sub_cmd, _, sub_arg = (cmd_arg or "").partition(" ")
+                sub_arg = sub_arg.strip()
+
+                if sub_cmd == "list" or not sub_cmd:
+                    if not _MCP_REGISTRY:
+                        console.print("[yellow]연결된 MCP 서버 없음[/yellow]")
+                    for sname, client in _MCP_REGISTRY.items():
+                        console.print(f"  [green]●[/green] [cyan]{sname}[/cyan]  port={client.port}  툴 {len(client.tools)}개")
+                        for t in client.tools:
+                            console.print(f"      [dim]{t['name']}[/dim]")
+
+                elif sub_cmd == "install":
+                    if not sub_arg:
+                        console.print("[red]사용법: /mcp install <npm패키지>  예) /mcp install @playwright/mcp[/red]")
+                    else:
+                        pkg = sub_arg.strip()
+                        console.print(f"[cyan]설치 중: {pkg}[/cyan]")
+                        r = subprocess.run(
+                            ["npm", "install", "-g", pkg],
+                            capture_output=True, text=True
+                        )
+                        if r.returncode != 0:
+                            console.print(f"[red]설치 실패:[/red]\n{r.stderr[:400]}")
+                        else:
+                            console.print(f"[green]✓ 설치 완료[/green]")
+                            # 서버 이름 추론: @scope/name → name, name → name
+                            sname = pkg.split("/")[-1].replace("-mcp", "").replace("server-", "")
+                            cmd_list = ["npx", pkg, "--headless"] if "playwright" in pkg else ["npx", pkg]
+                            # mcp.json 업데이트
+                            cfg_path = Path.home() / ".agentforge" / "mcp.json"
+                            try:
+                                cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {"servers": {}}
+                            except Exception:
+                                cfg = {"servers": {}}
+                            cfg.setdefault("servers", {})[sname] = {"command": cmd_list}
+                            cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+                            console.print(f"[dim]~/.agentforge/mcp.json 에 '{sname}' 등록됨[/dim]")
+                            # 즉시 연결 시도
+                            client = _MCPClient(sname, cmd_list)
+                            if client.start():
+                                _MCP_REGISTRY[sname] = client
+                                tool_names = [t["name"] for t in client.tools]
+                                console.print(f"[green]✓ 연결됨 — 툴 {len(tool_names)}개: {', '.join(tool_names[:5])}[/green]")
+                            else:
+                                console.print(f"[yellow]설치됐지만 서버 시작 실패. agentforge 재시작 시 자동 연결됩니다.[/yellow]")
+
+                elif sub_cmd == "remove":
+                    if not sub_arg:
+                        console.print("[red]사용법: /mcp remove <서버이름>[/red]")
+                    else:
+                        sname = sub_arg.strip()
+                        if sname in _MCP_REGISTRY:
+                            _MCP_REGISTRY[sname].stop()
+                            del _MCP_REGISTRY[sname]
+                        cfg_path = Path.home() / ".agentforge" / "mcp.json"
+                        if cfg_path.exists():
+                            try:
+                                cfg = json.loads(cfg_path.read_text())
+                                cfg.get("servers", {}).pop(sname, None)
+                                cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+                            except Exception:
+                                pass
+                        console.print(f"[cyan]{sname} 제거됨[/cyan]")
+                else:
+                    console.print("[red]사용법: /mcp list | /mcp install <pkg> | /mcp remove <name>[/red]")
 
             elif cmd_name == 'help':
                 for cmd, desc in SLASH_COMMANDS:
