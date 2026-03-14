@@ -2237,8 +2237,17 @@ def render_cmd_bar(buf1, buf2, status1: str, status2: str) -> Panel:
                  border_style="dim", box=box.SIMPLE, padding=(0, 1))
 
 
+def _fmt_elapsed(start: float) -> str:
+    """시작 시각으로부터 경과 시간을 'Xh Ym' 형식으로 반환."""
+    secs = int(time.time() - start)
+    h, m = divmod(secs // 60, 60)
+    if h > 0:
+        return f"{h}h {m:02d}m"
+    return f"{m}m {secs % 60:02d}s"
+
+
 def render_header(goal: str, iteration: int, max_iter: int, phase: str,
-                  rag_note: str = "") -> Panel:
+                  rag_note: str = "", session_start: float | None = None) -> Panel:
     g = goal[:72] + "..." if len(goal) > 72 else goal
     status = {
         "idle":      "[dim]명령 대기 중  목표를 입력하거나  /resume  /exit[/dim]",
@@ -2251,7 +2260,8 @@ def render_header(goal: str, iteration: int, max_iter: int, phase: str,
         "reassign":       "[bold red]⚠ GPU 충돌 — 재배정 필요[/bold red]",
     }.get(phase, phase)
     iter_str = f"  Iter [bold]{iteration}[/bold]/{max_iter}" if iteration > 0 else ""
-    content = f"[bold cyan]Goal:[/bold cyan] {g}\n{status}{iter_str}"
+    elapsed_str = f"  [dim]⏱ {_fmt_elapsed(session_start)}[/dim]" if session_start else ""
+    content = f"[bold cyan]Goal:[/bold cyan] {g}\n{status}{iter_str}{elapsed_str}"
     if rag_note:
         content += f"\n{rag_note}"
     return Panel(content, border_style="cyan", box=box.HEAVY_HEAD)
@@ -2855,6 +2865,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
     done = False
     bg_train: dict | None = None   # 백그라운드 학습 job 추적
     ab_cooldown = 0                # A/B 직후 N회는 정체 감지 억제
+    _session_start = time.time()   # 세션 시작 시각
 
     # 모드별 시스템 프롬프트 및 도구 선택
     worker_sys   = RESEARCH_WORKER_SYSTEM if mode == "research" else WORKER_SYSTEM
@@ -2892,7 +2903,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
     # ── END DEBUG ────────────────────────────────────────────────────────────
 
     def refresh(phase: str, iteration: int):
-        layout["header"].update(render_header(goal, iteration, max_iter, phase, _rag_note))
+        layout["header"].update(render_header(goal, iteration, max_iter, phase, _rag_note, _session_start))
         layout["worker"].update(render_worker_panel(
             worker_buf, iteration, worker_status[0], history, done))
         layout["evaluator"].update(render_evaluator_panel(
@@ -3191,6 +3202,7 @@ def run_dual_agent_loop(
     buf2 = deque(maxlen=WORKER_BUF_LINES)
     status1 = ["idle"]
     status2 = ["idle"]
+    _session_start = time.time()   # 세션 시작 시각
     done1 = False
     done2 = False
     current_task_a = task_a
@@ -3236,7 +3248,7 @@ def run_dual_agent_loop(
         _persist_session(_last_session)
 
     def refresh(phase: str, iteration: int):
-        layout["header"].update(render_header(goal, iteration, max_iter, phase, _rag_note))
+        layout["header"].update(render_header(goal, iteration, max_iter, phase, _rag_note, _session_start))
         layout["summary_bar"].update(
             render_summary_bar(current_task_a, current_task_b, status1[0], status2[0])
         )
