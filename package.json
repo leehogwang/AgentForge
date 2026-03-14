@@ -1,6 +1,6 @@
 {
   "name": "agentforge-multi",
-  "version": "0.1.26",
+  "version": "0.1.27",
   "description": "Multi-agent CLI: Worker + Evaluator agents collaborate in a loop to achieve your goal",
   "keywords": [
     "ai",

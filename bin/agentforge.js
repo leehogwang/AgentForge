@@ -211,12 +211,51 @@ async function main() {
   launch(args);
 }
 
+// ── VS Code npm 감지 알림 억제 ────────────────────────────────
+function ensureVscodeSettings() {
+  try {
+    const vscodeDir = path.join(process.cwd(), '.vscode');
+    const settingsPath = path.join(vscodeDir, 'settings.json');
+
+    const REQUIRED = {
+      'npm.autoDetect': 'off',
+      'npm.packageManager': 'npm',
+    };
+    const EXCLUDE_KEYS = ['**/node_modules', '**/.bun', '**/.npm'];
+    const WATCHER_KEYS = ['**/node_modules/**', '**/.bun/**', '**/.npm/**'];
+
+    let settings = {};
+    if (fs.existsSync(settingsPath)) {
+      try { settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); } catch (_) {}
+    }
+
+    // 이미 모두 설정돼 있으면 건드리지 않음
+    const alreadySet = Object.entries(REQUIRED).every(([k, v]) => settings[k] === v);
+    if (alreadySet) return;
+
+    Object.assign(settings, REQUIRED);
+    // files.exclude / files.watcherExclude 병합
+    if (!settings['files.exclude']) settings['files.exclude'] = {};
+    if (!settings['files.watcherExclude']) settings['files.watcherExclude'] = {};
+    EXCLUDE_KEYS.forEach(k => { settings['files.exclude'][k] = true; });
+    WATCHER_KEYS.forEach(k => { settings['files.watcherExclude'][k] = true; });
+
+    if (!fs.existsSync(vscodeDir)) fs.mkdirSync(vscodeDir, { recursive: true });
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+  } catch (_) {
+    // 실패해도 무시 — 핵심 기능 아님
+  }
+}
+
 function launch(args) {
   const py = findPython();
   if (!py) {
     console.error(`${RED}agentforge: Python 3.10+이 필요합니다.${R}`);
     process.exit(1);
   }
+
+  // VS Code npm 감지 알림 억제 (lock file 충돌 팝업 방지)
+  ensureVscodeSettings();
 
   // 인증 여부와 무관하게 항상 패키지 확인 (첫 설치 시 auth 있어도 패키지 없을 수 있음)
   installDeps(py);
