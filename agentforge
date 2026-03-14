@@ -324,8 +324,33 @@ def _iter_events(payload: dict):
         yield {"type": "_error", "message": str(e)}
 
 
+# ── DEBUG LOGGING ─────────────────────────────────────────────────────────────
+# 제거 방법: 이 블록(# ── DEBUG LOGGING ── 부터 # ── END DEBUG LOGGING ──까지) 삭제
+import datetime as _dt
+_DEBUG_LOG_PATH: str | None = None   # run_agent_loop / run_dual_agent_loop 에서 설정
+
+def _dbg(tag: str, msg: str) -> None:
+    """디버그 로그를 파일에 기록. _DEBUG_LOG_PATH가 None이면 무시."""
+    if _DEBUG_LOG_PATH is None:
+        return
+    ts = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    line = f"[{ts}] [{tag}] {msg}\n"
+    try:
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as _f:
+            _f.write(line)
+    except Exception:
+        pass
+# ── END DEBUG LOGGING ─────────────────────────────────────────────────────────
+
+
 def _execute_tool(name: str, args: dict, workdir: str, worker_id: int = 0) -> str:
     """Worker 도구 실행."""
+    # ── DEBUG: 도구 호출 시작 시각 기록 ──────────────────────────────────────
+    _dbg_label = f"W{worker_id}" if worker_id else "W?"
+    _arg_preview = str(args)[:120].replace("\n", " ")
+    _dbg(_dbg_label, f"TOOL_START  {name}  args={_arg_preview}")
+    _t0 = time.time()
+    # ── END DEBUG ────────────────────────────────────────────────────────────
     try:
         if name == "shell":
             timeout = min(int(args.get("timeout_seconds", 120)), 7200)
@@ -544,7 +569,14 @@ def _execute_tool(name: str, args: dict, workdir: str, worker_id: int = 0) -> st
         else:
             return f"Unknown tool: {name}"
     except Exception as e:
+        # ── DEBUG: 도구 오류 기록 ─────────────────────────────────────────────
+        _dbg(_dbg_label, f"TOOL_ERROR  {name}  elapsed={time.time()-_t0:.2f}s  err={e}")
+        # ── END DEBUG ────────────────────────────────────────────────────────
         return f"Error: {e}"
+    finally:
+        # ── DEBUG: 도구 완료 소요 시간 기록 ──────────────────────────────────
+        _dbg(_dbg_label, f"TOOL_END    {name}  elapsed={time.time()-_t0:.2f}s")
+        # ── END DEBUG ────────────────────────────────────────────────────────
 
 # ── Slash command autocomplete ────────────────────────────────────────────────
 
@@ -795,10 +827,131 @@ def _save_attempt(goal: str, record: dict) -> None:
         pass  # 저장 실패해도 에이전트 동작에 영향 없도록
 
 
-def _load_past_attempts(goal: str) -> list[dict]:
-    """과거 시도 기록 전체 로드."""
+_EMBED_MODEL = None
+_EMBED_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+
+def _get_embed_model():
+    """sentence-transformers 모델 lazy 로드 (최초 1회만)."""
+    global _EMBED_MODEL
+    if _EMBED_MODEL is None:
+        try:
+            import warnings
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            from sentence_transformers import SentenceTransformer
+            _EMBED_MODEL = SentenceTransformer(_EMBED_MODEL_NAME)
+        except Exception:
+            _EMBED_MODEL = False  # 실패 시 폴백 표시
+    return _EMBED_MODEL if _EMBED_MODEL is not False else None
+
+
+def _embed_goal(text: str):
+    """goal 텍스트 임베딩 벡터 반환. 모델 없으면 None."""
+    model = _get_embed_model()
+    if model is None:
+        return None
     try:
-        path = _knowledge_path(goal) / "attempts.jsonl"
+        import numpy as np
+        vec = model.encode(text, normalize_embeddings=True)
+        return vec.astype(np.float32)
+    except Exception:
+        return None
+
+
+def _cosine_sim(a, b) -> float:
+    """두 정규화된 벡터의 cosine similarity (내적)."""
+    try:
+        import numpy as np
+        return float(np.dot(a, b))
+    except Exception:
+        return 0.0
+
+
+def _goal_similarity_fallback(a: str, b: str) -> float:
+    """임베딩 불가 시 토큰 recall 폴백."""
+    def tokens(s: str) -> set:
+        return set(re.sub(r'[^\w가-힣]', ' ', s.lower()).split())
+    ta, tb = tokens(a), tokens(b)
+    if not ta or not tb:
+        return 0.0
+    shorter, longer = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    return len(shorter & longer) / len(shorter)
+
+
+def _ensure_goal_txt(d: Path) -> str:
+    """goal.txt 없으면 폴더명으로 복원 후 저장. 내용 반환."""
+    goal_txt = d / "goal.txt"
+    if goal_txt.exists():
+        try:
+            return goal_txt.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    text = d.name.replace("_", " ")
+    try:
+        goal_txt.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+    return text
+
+
+def _ensure_goal_embedding(d: Path, goal_text: str):
+    """
+    goal_embedding.npy 없으면 계산해서 저장.
+    저장된 벡터 반환. 실패 시 None.
+    """
+    import numpy as np
+    emb_path = d / "goal_embedding.npy"
+    if emb_path.exists():
+        try:
+            return np.load(str(emb_path))
+        except Exception:
+            pass
+    vec = _embed_goal(goal_text)
+    if vec is not None:
+        try:
+            np.save(str(emb_path), vec)
+        except Exception:
+            pass
+    return vec
+
+
+def _find_similar_goals(goal: str, threshold: float = 0.6) -> list[Path]:
+    """
+    KNOWLEDGE_DIR 내 모든 폴더와 유사도 비교.
+    - 임베딩 사용 가능: cosine similarity (goal_embedding.npy)
+    - 불가능: 토큰 recall 폴백
+    임계값 이상인 폴더 목록 반환 (현재 goal 폴더 제외).
+    """
+    if not KNOWLEDGE_DIR.exists():
+        return []
+
+    current_slug = _goal_to_slug(goal)
+    use_embedding = _get_embed_model() is not None
+    current_vec = _embed_goal(goal) if use_embedding else None
+
+    matched = []
+    for d in KNOWLEDGE_DIR.iterdir():
+        if not d.is_dir() or d.name == current_slug:
+            continue
+        candidate_text = _ensure_goal_txt(d)
+        if use_embedding and current_vec is not None:
+            cand_vec = _ensure_goal_embedding(d, candidate_text)
+            if cand_vec is not None:
+                sim = _cosine_sim(current_vec, cand_vec)
+            else:
+                sim = _goal_similarity_fallback(goal, candidate_text)
+        else:
+            sim = _goal_similarity_fallback(goal, candidate_text)
+        if sim >= threshold:
+            matched.append((sim, d))
+
+    matched.sort(key=lambda x: x[0], reverse=True)
+    return [d for _, d in matched]
+
+
+def _load_attempts_from_dir(d: Path) -> list[dict]:
+    """디렉토리에서 attempts.jsonl 로드."""
+    try:
+        path = d / "attempts.jsonl"
         if not path.exists():
             return []
         records = []
@@ -812,6 +965,35 @@ def _load_past_attempts(goal: str) -> list[dict]:
         return records
     except Exception:
         return []
+
+
+def _load_past_attempts(goal: str) -> list[dict]:
+    """
+    과거 시도 기록 로드.
+    1) 현재 goal 폴더 exact match
+    2) 유사 goal 폴더들 (Jaccard >= 0.6) 도 합산
+    """
+    # 현재 goal의 폴더에 goal.txt + 임베딩 저장 (향후 유사도 비교용)
+    try:
+        gdir = _knowledge_path(goal)
+        gtxt = gdir / "goal.txt"
+        if not gtxt.exists():
+            gtxt.write_text(goal, encoding="utf-8")
+        _ensure_goal_embedding(gdir, goal)
+    except Exception:
+        pass
+
+    records = _load_attempts_from_dir(_knowledge_path(goal))
+
+    # 유사 goal 폴더 병합
+    similar_dirs = _find_similar_goals(goal, threshold=0.6)
+    seen_dirs = {_goal_to_slug(goal)}
+    for d in similar_dirs:
+        if d.name not in seen_dirs:
+            seen_dirs.add(d.name)
+            records += _load_attempts_from_dir(d)
+
+    return records
 
 
 def _retrieve_relevant(query: str, attempts: list[dict], top_k: int = 6) -> list[dict]:
@@ -851,7 +1033,11 @@ def _build_rag_section(past_attempts: list[dict], current_context: str) -> str:
     if not past_attempts:
         return ""
 
-    relevant = _retrieve_relevant(current_context, past_attempts, top_k=6)
+    MAX_FULL = 50
+    if len(past_attempts) <= MAX_FULL:
+        relevant = past_attempts
+    else:
+        relevant = _retrieve_relevant(current_context, past_attempts, top_k=50)
     if not relevant:
         return ""
 
@@ -1260,10 +1446,38 @@ def _get_workspace_snapshot(workdir: str) -> str:
     return "\n".join(lines)
 
 
+def _get_gpu_status() -> str | None:
+    """nvidia-smi snapshot; returns None if not available."""
+    try:
+        import subprocess as _sp
+        r = _sp.run(
+            ["nvidia-smi",
+             "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        lines = []
+        for row in r.stdout.strip().splitlines():
+            parts = [p.strip() for p in row.split(",")]
+            if len(parts) >= 5:
+                idx, name, util, mem_used, mem_total = parts[:5]
+                lines.append(
+                    f"  GPU {idx} [{name}]  util={util}%  mem={mem_used}/{mem_total} MiB"
+                )
+            else:
+                lines.append("  " + row.strip())
+        return "\n".join(lines)
+    except Exception:
+        return None
+
+
 def build_evaluator_prompt(goal: str, worker_output: str, iteration: int,
                            workdir: str = ".",
                            past_attempts: list[dict] | None = None) -> str:
     snapshot = _get_workspace_snapshot(workdir)
+    gpu_status = _get_gpu_status()
     parts = [
         EVALUATOR_SYSTEM,
         "",
@@ -1281,6 +1495,14 @@ def build_evaluator_prompt(goal: str, worker_output: str, iteration: int,
             "WORKSPACE STATE (actual filesystem changes):",
             "─" * 60,
             snapshot,
+            "─" * 60,
+            "",
+        ]
+    if gpu_status:
+        parts += [
+            "GPU STATUS (nvidia-smi):",
+            "─" * 60,
+            gpu_status,
             "─" * 60,
             "",
         ]
@@ -1499,6 +1721,11 @@ def run_worker(prompt: str, workdir: str, model: str | None,
                tools: list | None = None,
                worker_id: int = 0) -> tuple[str, int]:
     """Worker: ChatGPT backend Responses API 직접 호출 + 병렬 도구 실행 루프."""
+    # ── DEBUG: worker 시작 ────────────────────────────────────────────────────
+    _wlabel = f"W{worker_id}" if worker_id else "WORKER"
+    _dbg(_wlabel, f"RUN_START  model={model or DEFAULT_WORKER_MODEL}")
+    _wt0 = time.time()
+    # ── END DEBUG ────────────────────────────────────────────────────────────
     model = model or DEFAULT_WORKER_MODEL
     system_prompt = system_prompt or WORKER_SYSTEM
     tools = tools if tools is not None else WORKER_TOOLS
@@ -1602,6 +1829,9 @@ def run_worker(prompt: str, workdir: str, model: str | None,
         buf.append(colorize_line(line_buf))
 
     status_ref[0] = "done"
+    # ── DEBUG: worker 완료 ────────────────────────────────────────────────────
+    _dbg(_wlabel, f"RUN_END    elapsed={time.time()-_wt0:.2f}s")
+    # ── END DEBUG ────────────────────────────────────────────────────────────
     return "\n".join(all_text_parts), 0
 
 
@@ -1611,6 +1841,10 @@ def run_evaluator(prompt: str, workdir: str, model: str | None,
     IMPROVE/REDIRECT는 첫 번째 완성 라인에서 결정 → 스트림 조기 종료.
     DONE은 한국어 요약까지 필요하므로 전체 수신.
     """
+    # ── DEBUG: evaluator 시작 ─────────────────────────────────────────────────
+    _dbg("EVAL", f"RUN_START  model={model or DEFAULT_EVAL_MODEL}")
+    _et0 = time.time()
+    # ── END DEBUG ────────────────────────────────────────────────────────────
     model = model or DEFAULT_EVAL_MODEL
     system_prompt = system_prompt or EVALUATOR_SYSTEM
     payload = {
@@ -1627,6 +1861,9 @@ def run_evaluator(prompt: str, workdir: str, model: str | None,
     try:
         for ev in gen:
             if ev["type"] == "_error":
+                # ── DEBUG ──────────────────────────────────────────────────
+                _dbg("EVAL", f"RUN_ERROR  elapsed={time.time()-_et0:.2f}s")
+                # ── END DEBUG ──────────────────────────────────────────────
                 return f"[Evaluator error] {ev['message']}", 1
             if ev["type"] == "response.output_text.delta":
                 delta = ev.get("delta", "")
@@ -1642,6 +1879,10 @@ def run_evaluator(prompt: str, workdir: str, model: str | None,
                             break  # 한국어 요약 불필요 → 스트림 종료
     finally:
         gen.close()
+    # ── DEBUG: evaluator 완료 ─────────────────────────────────────────────────
+    _result_preview = "".join(parts)[:60].replace("\n", " ")
+    _dbg("EVAL", f"RUN_END    elapsed={time.time()-_et0:.2f}s  result={_result_preview}")
+    # ── END DEBUG ────────────────────────────────────────────────────────────
     return "".join(parts), 0
 
 
@@ -1660,11 +1901,11 @@ def parse_decision(text: str) -> tuple[str, str]:
 def make_layout() -> Layout:
     import shutil
     term_h = shutil.get_terminal_size(fallback=(80, 40)).lines
-    body_size = max(10, term_h - 9)  # header(3) + cmd_bar(3) + 여백(3)
+    body_size = max(10, term_h - 11)  # header(5) + cmd_bar(3) + 여백(3)
 
     layout = Layout()
     layout.split(
-        Layout(name="header", size=3),
+        Layout(name="header", size=5),
         Layout(name="body",   size=body_size),
         Layout(name="cmd_bar", size=3),
     )
@@ -1678,10 +1919,10 @@ def make_layout() -> Layout:
 def make_dual_layout() -> Layout:
     import shutil
     term_h = shutil.get_terminal_size(fallback=(80, 40)).lines
-    body_size = max(10, term_h - 11)  # header(3) + summary_bar(3) + cmd_bar(3) + margin(2)
+    body_size = max(10, term_h - 13)  # header(5) + summary_bar(3) + cmd_bar(3) + margin(2)
     layout = Layout()
     layout.split(
-        Layout(name="header",      size=3),
+        Layout(name="header",      size=5),
         Layout(name="summary_bar", size=3),
         Layout(name="body",        size=body_size),
         Layout(name="cmd_bar",     size=3),
@@ -1737,7 +1978,8 @@ def render_cmd_bar(buf1, buf2, status1: str, status2: str) -> Panel:
                  border_style="dim", box=box.SIMPLE, padding=(0, 1))
 
 
-def render_header(goal: str, iteration: int, max_iter: int, phase: str) -> Panel:
+def render_header(goal: str, iteration: int, max_iter: int, phase: str,
+                  rag_note: str = "") -> Panel:
     g = goal[:72] + "..." if len(goal) > 72 else goal
     status = {
         "idle":      "[dim]명령 대기 중  목표를 입력하거나  /resume  /exit[/dim]",
@@ -1751,6 +1993,8 @@ def render_header(goal: str, iteration: int, max_iter: int, phase: str) -> Panel
     }.get(phase, phase)
     iter_str = f"  Iter [bold]{iteration}[/bold]/{max_iter}" if iteration > 0 else ""
     content = f"[bold cyan]Goal:[/bold cyan] {g}\n{status}{iter_str}"
+    if rag_note:
+        content += f"\n{rag_note}"
     return Panel(content, border_style="cyan", box=box.HEAVY_HEAD)
 
 
@@ -2336,17 +2580,30 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
     # ── 지식 저장소 로드 ─────────────────────────────────────────────────
     past_attempts = _load_past_attempts(goal)
     knowledge_dir = _knowledge_path(goal)
+    similar_dirs = _find_similar_goals(goal, threshold=0.6)
     if past_attempts:
-        console.print(
-            f"[dim]📚 지식 저장소 로드: {knowledge_dir.name}/ "
-            f"({len(past_attempts)}개 과거 시도)[/dim]"
-        )
+        if similar_dirs:
+            _rag_note = (
+                f"[dim]📚 RAG: {len(past_attempts)}개 시도 로드"
+                f" ([cyan]+{len(similar_dirs)}개 유사 목표 병합[/cyan]:"
+                + ", ".join(d.name[:30] for d in similar_dirs[:3]) + ")[/dim]"
+            )
+        else:
+            _rag_note = f"[dim]📚 RAG: {len(past_attempts)}개 과거 시도 로드 (exact match)[/dim]"
+    else:
+        _rag_note = "[dim]📚 RAG: 매칭 없음 — 새 목표로 시작[/dim]"
 
     def _finish(result: str) -> str:
         return result
 
+    # ── DEBUG: 로그 파일 경로 설정 (agentforge 실행 위치에 생성) ───────────────
+    global _DEBUG_LOG_PATH
+    _DEBUG_LOG_PATH = str(Path(workdir) / f"agentforge_debug_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    _dbg("LOOP", f"SESSION_START  mode={mode}  workdir={workdir}  goal={goal[:80]}")
+    # ── END DEBUG ────────────────────────────────────────────────────────────
+
     def refresh(phase: str, iteration: int):
-        layout["header"].update(render_header(goal, iteration, max_iter, phase))
+        layout["header"].update(render_header(goal, iteration, max_iter, phase, _rag_note))
         layout["worker"].update(render_worker_panel(
             worker_buf, iteration, worker_status[0], history, done))
         layout["evaluator"].update(render_evaluator_panel(
@@ -2356,6 +2613,10 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
         )
 
     for iteration in range(1, max_iter + 1):
+        # ── DEBUG: 이터레이션 시작 ────────────────────────────────────────
+        _dbg("LOOP", f"ITER_START  iteration={iteration}")
+        _iter_t0 = time.time()
+        # ── END DEBUG ────────────────────────────────────────────────────
         # ── Worker ──────────────────────────────────────────────────────
         worker_buf.clear()
         worker_status[0] = "running"
@@ -2648,9 +2909,28 @@ def run_dual_agent_loop(
 
     past_attempts1 = _load_past_attempts(task_a)
     past_attempts2 = _load_past_attempts(task_b)
+    _sim1 = _find_similar_goals(task_a, threshold=0.6)
+    _sim2 = _find_similar_goals(task_b, threshold=0.6)
+    def _rag_line(attempts, sim_dirs):
+        if attempts:
+            if sim_dirs:
+                return (f"[dim]📚 RAG: {len(attempts)}개 시도"
+                        f" ([cyan]+{len(sim_dirs)}개 유사 병합[/cyan])[/dim]")
+            return f"[dim]📚 RAG: {len(attempts)}개 과거 시도 (exact)[/dim]"
+        return "[dim]📚 RAG: 매칭 없음[/dim]"
+    _rag_note = _rag_line(past_attempts1 or past_attempts2,
+                          _sim1 + [d for d in _sim2 if d not in _sim1])
 
     def _finish(result: str) -> str:
         return result
+
+    # ── DEBUG: 로그 파일 경로 설정 (agentforge 실행 위치에 생성) ───────────────
+    global _DEBUG_LOG_PATH
+    _DEBUG_LOG_PATH = str(Path(workdir) / f"agentforge_debug_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    _dbg("LOOP", f"SESSION_START  mode=dual  workdir={workdir}  goal={goal[:80]}")
+    _dbg("LOOP", f"TASK_A={task_a[:80]}")
+    _dbg("LOOP", f"TASK_B={task_b[:80]}")
+    # ── END DEBUG ────────────────────────────────────────────────────────────
 
     def _persist_dual():
         global _last_session
@@ -2664,7 +2944,7 @@ def run_dual_agent_loop(
         _persist_session(_last_session)
 
     def refresh(phase: str, iteration: int):
-        layout["header"].update(render_header(goal, iteration, max_iter, phase))
+        layout["header"].update(render_header(goal, iteration, max_iter, phase, _rag_note))
         layout["summary_bar"].update(
             render_summary_bar(current_task_a, current_task_b, status1[0], status2[0])
         )
@@ -2688,6 +2968,10 @@ def run_dual_agent_loop(
     refresh("idle", 0)
 
     for iteration in range(1, max_iter + 1):
+        # ── DEBUG: 이터레이션 시작 ────────────────────────────────────────
+        _dbg("LOOP", f"ITER_START  iteration={iteration}  done1={done1}  done2={done2}")
+        _iter_t0 = time.time()
+        # ── END DEBUG ────────────────────────────────────────────────────
         if done1 and done2:
             break
 
