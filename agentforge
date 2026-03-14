@@ -75,7 +75,6 @@ from rich.rule import Rule
 from rich.text import Text
 from rich import box
 
-from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.styles import Style as PtStyle
 from prompt_toolkit.formatted_text import HTML
@@ -3472,19 +3471,14 @@ def run_dual_agent_loop(
             console.print()
 
             try:
-                choice_str = PromptSession(style=PROMPT_STYLE, mouse_support=False).prompt(
-                    HTML('<ansiyellow>선택 (번호)</ansiyellow> <ansiwhite>></ansiwhite> ')
-                ).strip()
+                choice_str = input('\x1b[33m선택 (번호)\x1b[0m \x1b[37m>\x1b[0m ').strip()
                 choice = int(choice_str)
             except (ValueError, EOFError, KeyboardInterrupt):
                 choice = -1
 
             if choice == 0:
                 try:
-                    user_instruction = PromptSession(style=PROMPT_STYLE, mouse_support=False).prompt(
-                        HTML(f'<ansicyan>Worker {rw} 에게 내릴 명령</ansicyan> '
-                             f'<ansiwhite>></ansiwhite> ')
-                    ).strip()
+                    user_instruction = input(f'\x1b[36mWorker {rw} 에게 내릴 명령\x1b[0m \x1b[37m>\x1b[0m ').strip()
                 except (EOFError, KeyboardInterrupt):
                     user_instruction = ""
                 if user_instruction:
@@ -3587,10 +3581,7 @@ def _handle_interrupt(goal: str, workdir: str, args, max_iter: int) -> str:
         "목표를 수정하거나 Enter로 재실행, Ctrl+C로 REPL 복귀:"
     )
     try:
-        new_goal = PromptSession(style=PROMPT_STYLE, mouse_support=False).prompt(
-            HTML('<ansiyellow><b>목표 수정</b></ansiyellow> <ansiwhite>></ansiwhite> '),
-            default=goal,
-        ).strip()
+        new_goal = input('\x1b[33m\x1b[1m목표 수정\x1b[0m \x1b[37m>\x1b[0m ').strip()
     except (EOFError, KeyboardInterrupt):
         console.print("[dim]취소됨. REPL로 돌아갑니다.[/dim]")
         return goal
@@ -3732,22 +3723,32 @@ def main():
 
     console.print(f"[dim]명령을 입력하세요. /help 로 커맨드 목록 확인. 모드: {current_mode}[/dim]")
 
-    _completer = SlashCompleter()
-    _session = PromptSession(
-        completer=_completer,
-        complete_while_typing=False,  # Tab 키로만 완성 (타이핑 중 스캔 금지)
-        style=PROMPT_STYLE,
-        mouse_support=False,          # SSH에서 마우스 모드가 Ctrl 키 충돌 유발
-    )
+    # readline 기반 프롬프트 (SSH 환경에서 bracketed paste / CPR 문제 없음)
+    try:
+        import readline as _readline
+        _slash_cmds = [cmd for cmd, _ in SLASH_COMMANDS]
+        def _rl_completer(text, state):
+            if text.startswith('/'):
+                opts = [c for c in _slash_cmds if c.startswith(text)]
+                return opts[state] if state < len(opts) else None
+            return None
+        _readline.set_completer(_rl_completer)
+        _readline.set_completer_delims('')
+        _readline.parse_and_bind('tab: complete')
+    except ImportError:
+        pass
+
+    _PROMPT = '\x1b[36m\x1b[1m[agentforge]\x1b[0m \x1b[37m>\x1b[0m '
 
     while True:
         try:
-            raw = _session.prompt(
-                HTML('<ansicyan><b>[agentforge]</b></ansicyan> <ansiwhite>></ansiwhite> '),
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
+            raw = input(_PROMPT).strip()
+        except EOFError:
             console.print("\n[dim]종료합니다.[/dim]")
             break
+        except KeyboardInterrupt:
+            console.print("")
+            continue
 
         if not raw:
             continue
