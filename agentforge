@@ -11,12 +11,52 @@ Slash commands:
   <일반 텍스트>  Worker에게 즉시 전달 (목표 설정)
 """
 
+import subprocess
+import sys
+
+# ── 필수 패키지 자동 설치 (import 전에 실행) ─────────────────────────────────
+def _ensure_deps():
+    _REQUIRED = [
+        ('rich',           'rich'),
+        ('prompt_toolkit', 'prompt_toolkit'),
+        ('requests',       'requests'),
+        ('rank_bm25',      'rank-bm25'),
+        ('tiktoken',       'tiktoken'),
+    ]
+    missing_pkgs = []
+    for mod, pkg in _REQUIRED:
+        try:
+            __import__(mod)
+        except ImportError:
+            missing_pkgs.append(pkg)
+    if not missing_pkgs:
+        return
+    print(f"[agentforge] 필수 패키지 설치 중: {', '.join(missing_pkgs)}", flush=True)
+    try:
+        subprocess.check_call(
+            [sys.executable, '-m', 'pip', 'install', '--quiet'] + missing_pkgs
+        )
+    except subprocess.CalledProcessError:
+        # --user 로 재시도
+        try:
+            subprocess.check_call(
+                [sys.executable, '-m', 'pip', 'install', '--quiet', '--user'] + missing_pkgs
+            )
+        except subprocess.CalledProcessError:
+            print(f"[agentforge] 설치 실패. 수동으로 실행하세요: pip install {' '.join(missing_pkgs)}")
+            sys.exit(1)
+    print("[agentforge] 설치 완료. 시작합니다...", flush=True)
+    # 새로 설치된 패키지를 인식하도록 재실행
+    import os as _os
+    _os.execv(sys.executable, [sys.executable] + sys.argv)
+
+_ensure_deps()
+# ─────────────────────────────────────────────────────────────────────────────
+
 import argparse
 import json
 import os
 import re
-import subprocess
-import sys
 import textwrap
 import threading
 import time
@@ -2278,22 +2318,9 @@ _DECISION_BADGE = {
 }
 
 # 파일 경로 패턴 (절대경로 or ./상대경로)
-_PATH_RE = re.compile(r'(/[\w./\-_@:~가-힣]+(?:\.\w+)?|\.{1,2}/[\w./\-_@:~가-힣]+(?:\.\w+)?)')
-
 def _osc8_linkify(text: str) -> str:
-    """
-    텍스트 내 파일 경로를 OSC 8 하이퍼링크로 변환.
-    터미널에서 Ctrl+클릭 시 파일/폴더 열림 (VSCode, iTerm2 등 지원).
-    """
-    def replace(m: re.Match) -> str:
-        path = m.group(0)
-        p = Path(path).expanduser()
-        if p.exists():
-            uri = f"file://{p.resolve()}"
-            # OSC 8 이스케이프: \x1b]8;;URI\x1b\\TEXT\x1b]8;;\x1b\\
-            return f"\x1b]8;;{uri}\x1b\\{path}\x1b]8;;\x1b\\"
-        return path
-    return _PATH_RE.sub(replace, text)
+    """OSC 8 하이퍼링크 비활성화 — SSH 환경에서 escape 시퀀스가 Ctrl 키 충돌 유발."""
+    return text
 
 def render_worker_panel(buf: deque, iteration: int, status: str,
                         history: list, done: bool, label: str = "WORKER") -> Panel:

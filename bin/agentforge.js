@@ -91,12 +91,19 @@ function findPython() {
 }
 
 // ── pip 의존성 설치 ───────────────────────────────────
+const DEPS_STAMP = path.join(os.homedir(), '.agentforge', '.deps_ok');
+
 function installDeps(py) {
+  // 이미 설치 확인이 된 경우 스킵 (stamp 파일 기준)
+  if (fs.existsSync(DEPS_STAMP)) return;
+
   const missing = DEPS.filter(d =>
     spawnSync(py.bin, [...py.extra, '-c', `import ${d.import}`], { encoding: 'utf8' }).status !== 0
   );
   if (missing.length === 0) {
-    console.log(`${GREEN}✓${R} Python 패키지 준비 완료`);
+    // stamp 파일 생성 (다음 실행부터 체크 생략)
+    try { fs.mkdirSync(path.dirname(DEPS_STAMP), { recursive: true }); } catch (_) {}
+    try { fs.writeFileSync(DEPS_STAMP, new Date().toISOString()); } catch (_) {}
     return;
   }
 
@@ -113,6 +120,7 @@ function installDeps(py) {
     }
   }
   console.log(`${GREEN}✓${R} 설치 완료: ${names.join(', ')}`);
+  try { fs.writeFileSync(DEPS_STAMP, new Date().toISOString()); } catch (_) {}
 }
 
 // ── codex 인증 ────────────────────────────────────────
@@ -209,6 +217,9 @@ function launch(args) {
     console.error(`${RED}agentforge: Python 3.10+이 필요합니다.${R}`);
     process.exit(1);
   }
+
+  // 인증 여부와 무관하게 항상 패키지 확인 (첫 설치 시 auth 있어도 패키지 없을 수 있음)
+  installDeps(py);
 
   if (!WIN) {
     try { fs.chmodSync(SCRIPT, 0o755); } catch (_) {}
