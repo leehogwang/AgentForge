@@ -3445,7 +3445,7 @@ def run_dual_agent_loop(
             console.print()
 
             try:
-                choice_str = PromptSession(style=PROMPT_STYLE).prompt(
+                choice_str = PromptSession(style=PROMPT_STYLE, mouse_support=False).prompt(
                     HTML('<ansiyellow>선택 (번호)</ansiyellow> <ansiwhite>></ansiwhite> ')
                 ).strip()
                 choice = int(choice_str)
@@ -3454,7 +3454,7 @@ def run_dual_agent_loop(
 
             if choice == 0:
                 try:
-                    user_instruction = PromptSession(style=PROMPT_STYLE).prompt(
+                    user_instruction = PromptSession(style=PROMPT_STYLE, mouse_support=False).prompt(
                         HTML(f'<ansicyan>Worker {rw} 에게 내릴 명령</ansicyan> '
                              f'<ansiwhite>></ansiwhite> ')
                     ).strip()
@@ -3560,7 +3560,7 @@ def _handle_interrupt(goal: str, workdir: str, args, max_iter: int) -> str:
         "목표를 수정하거나 Enter로 재실행, Ctrl+C로 REPL 복귀:"
     )
     try:
-        new_goal = PromptSession(style=PROMPT_STYLE).prompt(
+        new_goal = PromptSession(style=PROMPT_STYLE, mouse_support=False).prompt(
             HTML('<ansiyellow><b>목표 수정</b></ansiyellow> <ansiwhite>></ansiwhite> '),
             default=goal,
         ).strip()
@@ -3708,8 +3708,9 @@ def main():
     _completer = SlashCompleter()
     _session = PromptSession(
         completer=_completer,
-        complete_while_typing=True,
+        complete_while_typing=False,  # Tab 키로만 완성 (타이핑 중 스캔 금지)
         style=PROMPT_STYLE,
+        mouse_support=False,          # SSH에서 마우스 모드가 Ctrl 키 충돌 유발
     )
 
     while True:
