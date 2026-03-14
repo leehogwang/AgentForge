@@ -977,7 +977,13 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
         (progress made but refinements needed — same general approach)
 
       REDIRECT: <description of a completely different approach>
-        (current approach is fundamentally wrong, OR hardcoding was detected)
+        (current approach is fundamentally wrong, OR hardcoding was detected,
+         OR you have issued IMPROVE 5+ times for the same unresolved issue — in that case
+         REDIRECT to a completely different strategy, not just a refinement)
+
+    ⚠ STAGNATION RULE: If CURRENT ITERATION is high (≥ 15) and the core issue in
+    your feedback is the same as what you've said before, you MUST issue REDIRECT
+    (not IMPROVE). Repeating the same IMPROVE is not helpful — force a strategy change.
 
     When responding with DONE, after the keyword write a Korean summary in this EXACT format:
 
@@ -1592,8 +1598,21 @@ def compress_history(history: list, goal: str, model: str | None) -> list:
 
 
 def build_worker_prompt(goal: str, history: list,
-                        past_attempts: list[dict] | None = None) -> str:
+                        past_attempts: list[dict] | None = None,
+                        session_context: list[dict] | None = None) -> str:
     lines = [f"GOAL: {goal}", ""]
+
+    # 같은 REPL 세션에서 이전에 완료한 목표들의 컨텍스트
+    if session_context:
+        lines.append("PREVIOUS SESSION CONTEXT (completed earlier in this same session):")
+        for sc in session_context[-3:]:  # 최근 3개만
+            outcome_str = {"done": "✓ 완료", "max": "반복 초과 미완", "interrupted": "중단"}.get(sc.get("outcome",""), sc.get("outcome",""))
+            lines.append(f"  - Goal: {sc['goal'][:120]}")
+            lines.append(f"    Outcome: {outcome_str} ({sc['iter_count']} iterations)")
+            if sc.get("last_feedback"):
+                lines.append(f"    Last evaluator note: {sc['last_feedback'][:120]}")
+        lines.append("  Build on this context. Do not repeat already-solved work.")
+        lines.append("")
 
     # RAG 섹션: 현재 상황을 쿼리로 과거 시도 검색·삽입
     if past_attempts:
@@ -1702,16 +1721,29 @@ def _get_gpu_status() -> str | None:
 
 def build_evaluator_prompt(goal: str, worker_output: str, iteration: int,
                            workdir: str = ".",
-                           past_attempts: list[dict] | None = None) -> str:
+                           past_attempts: list[dict] | None = None,
+                           history: list | None = None) -> str:
     snapshot = _get_workspace_snapshot(workdir)
     gpu_status = _get_gpu_status()
+    # IMPROVE 연속 횟수 계산
+    improve_count = 0
+    if history:
+        for h in reversed(history):
+            if h.get('type') == 'compressed_summary':
+                continue
+            if h.get('decision') in ('IMPROVE', 'REDIRECT'):
+                improve_count += 1
+            else:
+                break
     parts = [
         EVALUATOR_SYSTEM,
         "",
         f"ORIGINAL GOAL: {goal}",
         f"CURRENT ITERATION: {iteration}",
-        "",
     ]
+    if improve_count >= 3:
+        parts.append(f"⚠ IMPROVE/REDIRECT issued {improve_count} times in a row without resolution.")
+    parts.append("")
     # RAG: 과거 시도 중 현재 워커 출력과 관련된 것 삽입
     if past_attempts:
         rag = _build_rag_section(past_attempts, worker_output[-500:] or goal)
@@ -2532,18 +2564,28 @@ def _git_diff_stat(workdir: str) -> str:
 # ── Stagnation Detection ──────────────────────────────────────────────────────
 
 def _detect_stagnation(history: list, threshold: int = STAGNATION_THRESHOLD) -> bool:
-    """최근 threshold개 iteration이 전부 IMPROVE/REDIRECT이면서 피드백이 유사하면 정체."""
+    """CONTINUE를 건너뛰고 IMPROVE/REDIRECT만 추출해 N회 유사 피드백이면 정체."""
     real = [h for h in history if h.get('type') != 'compressed_summary']
-    if len(real) < threshold:
+    # CONTINUE는 무시하고 IMPROVE/REDIRECT만 추출
+    improve_only = [h for h in real if h.get('decision') in ('IMPROVE', 'REDIRECT')]
+    if len(improve_only) < threshold:
         return False
-    recent = real[-threshold:]
-    if not all(h.get('decision') in ('IMPROVE', 'REDIRECT') for h in recent):
-        return False
-    feedbacks = [h.get('feedback', '')[:50] for h in recent]
-    summaries = [h.get('worker_summary', '')[:60] for h in recent]
+    recent = improve_only[-threshold:]
+    feedbacks = [h.get('feedback', '')[:80] for h in recent]
+    summaries = [h.get('worker_summary', '')[:80] for h in recent]
+    # 완전 동일
     if len(set(feedbacks)) == 1 or len(set(summaries)) == 1:
         return True
-    return False
+    # 단어 겹침으로 유사도 판단 (Jaccard ≥ 0.3 → 유사)
+    def _jaccard(a: str, b: str) -> float:
+        sa, sb = set(a.lower().split()), set(b.lower().split())
+        if not sa or not sb:
+            return 0.0
+        return len(sa & sb) / len(sa | sb)
+    for i in range(len(feedbacks) - 1):
+        if _jaccard(feedbacks[i], feedbacks[i + 1]) < 0.3:
+            return False
+    return True
 
 
 # ── A/B Strategy Fork ────────────────────────────────────────────────────────
@@ -2799,7 +2841,8 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                    initial_eval_history: list | None = None,
                    mode: str = "code",
                    eval_every: int = 1,
-                   train_poll_seconds: int = 300) -> str:
+                   train_poll_seconds: int = 300,
+                   session_context: list | None = None) -> str:
     """
     Worker + Evaluator 반복 루프.
     반환: 'done' | 'max' | 'interrupted'
@@ -2901,7 +2944,8 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
             ab_cooldown = STAGNATION_THRESHOLD  # A/B 직후 N회는 재발동 억제
         else:
             # 일반 Worker 실행
-            worker_prompt = build_worker_prompt(goal, history, past_attempts=past_attempts)
+            worker_prompt = build_worker_prompt(goal, history, past_attempts=past_attempts,
+                                                session_context=session_context)
             worker_result = [None, None]
 
             def _worker():
@@ -3014,7 +3058,8 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
         if iteration % eval_every == 0 or iteration == max_iter:
             refresh("evaluator", iteration)
             eval_prompt = build_evaluator_prompt(goal, last_msg or "", iteration, workdir,
-                                                 past_attempts=past_attempts)
+                                                 past_attempts=past_attempts,
+                                                 history=history)
             eval_msg, _ = run_evaluator(eval_prompt, workdir, eval_model,
                                         system_prompt=eval_sys)
         else:
@@ -3131,6 +3176,7 @@ def run_dual_agent_loop(
     initial_history1=None, initial_history2=None,
     initial_eval_history1=None, initial_eval_history2=None,
     mode: str = "code", eval_every: int = 1,
+    session_context: list | None = None,
 ) -> str:
     """
     Dual Worker + Dual Evaluator 병렬 루프.
@@ -3237,7 +3283,8 @@ def run_dual_agent_loop(
         def _w1():
             if done1:
                 return
-            prompt = build_worker_prompt(current_task_a, history1, past_attempts=past_attempts1)
+            prompt = build_worker_prompt(current_task_a, history1, past_attempts=past_attempts1,
+                                         session_context=session_context)
             w1_result[0], w1_result[1] = run_worker(
                 prompt, workdir, worker_model, buf1, status1,
                 system_prompt=worker_sys, tools=active_tools, worker_id=1)
@@ -3245,7 +3292,8 @@ def run_dual_agent_loop(
         def _w2():
             if done2:
                 return
-            prompt = build_worker_prompt(current_task_b, history2, past_attempts=past_attempts2)
+            prompt = build_worker_prompt(current_task_b, history2, past_attempts=past_attempts2,
+                                         session_context=session_context)
             w2_result[0], w2_result[1] = run_worker(
                 prompt, workdir, worker_model, buf2, status2,
                 system_prompt=worker_sys, tools=active_tools, worker_id=2)
@@ -3301,7 +3349,7 @@ def run_dual_agent_loop(
             if done1:
                 return
             ep = build_evaluator_prompt(current_task_a, msg1, iteration, workdir,
-                                        past_attempts=past_attempts1)
+                                        past_attempts=past_attempts1, history=history1)
             eval1_result[0], eval1_result[1] = run_evaluator(
                 ep, workdir, eval_model, system_prompt=DUAL_EVALUATOR_SYSTEM)
 
@@ -3309,7 +3357,7 @@ def run_dual_agent_loop(
             if done2:
                 return
             ep = build_evaluator_prompt(current_task_b, msg2, iteration, workdir,
-                                        past_attempts=past_attempts2)
+                                        past_attempts=past_attempts2, history=history2)
             eval2_result[0], eval2_result[1] = run_evaluator(
                 ep, workdir, eval_model, system_prompt=DUAL_EVALUATOR_SYSTEM)
 
@@ -3628,6 +3676,8 @@ def main():
     current_mode = args.mode
     eval_every   = args.eval_every
     # _last_session은 /resume 시점에 디스크에서 로드 (기본은 항상 새 시작)
+    # 같은 REPL 세션에서 완료된 목표들의 요약 컨텍스트
+    _session_summaries: list[dict] = []
 
     # MCP 서버 초기화
     _mcp_init()
@@ -3932,6 +3982,7 @@ def main():
                     args.worker_model, args.eval_model,
                     max_iter, layout2, live2,
                     mode=current_mode, eval_every=eval_every,
+                    session_context=_session_summaries if _session_summaries else None,
                 )
             else:
                 layout2 = make_layout()
@@ -3944,7 +3995,24 @@ def main():
                     goal, workdir, args.worker_model, args.eval_model,
                     max_iter, layout2, live2,
                     mode=current_mode, eval_every=eval_every,
+                    session_context=_session_summaries if _session_summaries else None,
                 )
+            # 완료된 세션 요약을 다음 목표를 위해 저장
+            if outcome != 'interrupted' and _last_session:
+                sess = _last_session
+                real_history = [h for h in sess.get("history", [])
+                                if h.get("type") != "compressed_summary"]
+                last_fb = next(
+                    (h.get("feedback", "") for h in reversed(real_history)
+                     if h.get("decision") in ("IMPROVE", "REDIRECT", "DONE")),
+                    ""
+                )
+                _session_summaries.append({
+                    "goal": sess.get("goal", goal),
+                    "outcome": outcome,
+                    "iter_count": len(real_history),
+                    "last_feedback": last_fb,
+                })
             if outcome == 'interrupted':
                 console.print("\n[yellow]⚠  중단됨. REPL로 돌아갑니다.[/yellow]")
             elif outcome == 'max':
