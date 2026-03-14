@@ -40,6 +40,10 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.styles import Style as PtStyle
 from prompt_toolkit.formatted_text import HTML
 
+# SSH 환경에서 CPR(커서 위치 요청) 미지원 경고 및 키 입력 오작동 방지
+import os as _os
+_os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
+
 # ── MCP Client ────────────────────────────────────────────────────────────────
 
 class _MCPClient:
