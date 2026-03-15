@@ -54,8 +54,11 @@ _ensure_deps()
 # ─────────────────────────────────────────────────────────────────────────────
 
 import argparse
+import hashlib
+import io
 import json
 import os
+import queue
 import re
 import textwrap
 import threading
@@ -77,8 +80,24 @@ from rich import box
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
+from prompt_toolkit.filters import Condition, has_focus
+from prompt_toolkit.formatted_text import ANSI, HTML, to_formatted_text
 from prompt_toolkit.styles import Style as PtStyle
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.application import Application
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import (
+    ConditionalContainer,
+    Float,
+    FloatContainer,
+    HSplit,
+    Layout as PtLayout,
+    Window,
+)
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.dimension import D
+from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.widgets import Frame, TextArea
 
 # ── MCP Client ────────────────────────────────────────────────────────────────
 
@@ -232,44 +251,19 @@ class _MCPClient:
 _MCP_REGISTRY: dict[str, _MCPClient] = {}
 
 def _mcp_init():
-    """
-    ~/.agentforge/mcp.json 에 정의된 서버들을 시작.
-    형식:
-    {
-      "servers": {
-        "playwright": {
-          "command": ["npx", "@playwright/mcp"],
-          "env": {}
-        }
-      }
-    }
-    """
     global _MCP_REGISTRY
     config_path = Path.home() / ".agentforge" / "mcp.json"
-
-    # 기본값: playwright + tavily 인터넷 검색
-    default_servers = {
-        "playwright": {
-            "command": ["npx", "@playwright/mcp", "--headless"],
-        },
-        "tavily": {
-            "command": ["npx", "tavily-mcp"],
-        },
-    }
-
-    if config_path.exists():
-        try:
-            cfg = json.loads(config_path.read_text(encoding="utf-8"))
-            servers = cfg.get("servers", default_servers)
-        except Exception:
-            servers = default_servers
-    else:
-        servers = default_servers
-
+    if not config_path.exists():
+        return  # mcp.json 없으면 MCP 비활성화
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        servers = cfg.get("servers", {})
+    except Exception:
+        return
     for name, conf in servers.items():
         cmd = conf.get("command", [])
         env = conf.get("env", None) or None
-        port = conf.get("port", 0)  # 0 = 자동 할당
+        port = conf.get("port", 0)
         client = _MCPClient(name, cmd, port=port, env=env)
         if client.start():
             _MCP_REGISTRY[name] = client
@@ -303,7 +297,8 @@ def _mcp_call(tool_name: str, args: dict) -> str | None:
 
 CODEX_BIN = Path.home() / ".npm-global" / "bin" / "codex"
 KNOWLEDGE_DIR  = Path.home() / ".agentforge" / "knowledge"   # 영구 지식 저장소 루트
-SESSION_FILE   = Path.home() / ".agentforge" / "last_session.json"  # 세션 영속화
+SESSION_ROOT   = Path.home() / ".agentforge" / "sessions"
+LEGACY_SESSION_FILE = Path.home() / ".agentforge" / "last_session.json"
 DEFAULT_MAX_ITER = 5000
 WORKER_BUF_LINES = 60
 DEFAULT_WORKER_MODEL = "gpt-5.4"
@@ -327,7 +322,108 @@ _ACTIVE_GPU: dict[int, int | None] = {1: None, 2: None}  # worker_id → gpu_id
 _ACTIVE_GPU_LOCK = threading.Lock()
 _GPU_CONFLICT_THRESH = 0.85
 
+def _capture_rich_text(*objects, width: int | None = None,
+                       height: int | None = None, **print_kwargs) -> str:
+    stream = io.StringIO()
+    temp_console = Console(
+        file=stream,
+        force_terminal=True,
+        color_system="truecolor",
+        width=width,
+        height=height,
+        legacy_windows=False,
+    )
+    temp_console.print(*objects, **print_kwargs)
+    return stream.getvalue().rstrip("\n")
+
+
+class SessionContext:
+    def __init__(self, workdir: str):
+        resolved = str(Path(workdir).resolve())
+        base = Path(resolved).name or "root"
+        slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", base).strip("-") or "root"
+        digest = hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:10]
+        self.workdir = resolved
+        self.key = f"{slug}-{digest}"
+        self.dir = SESSION_ROOT / self.key
+        self.session_file = self.dir / "session.json"
+        self.ui_state_file = self.dir / "ui_state.json"
+        self.event_log_file = self.dir / "events.jsonl"
+        self.tmux_session = f"agentforge-{digest}"
+
+
+_SESSION_CTX: SessionContext | None = None
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    tmp.replace(path)
+
+
+def _append_jsonl(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _set_session_context(workdir: str) -> SessionContext:
+    global _SESSION_CTX
+    _SESSION_CTX = SessionContext(workdir)
+    _SESSION_CTX.dir.mkdir(parents=True, exist_ok=True)
+    return _SESSION_CTX
+
+
+def _current_session_file() -> Path:
+    return _SESSION_CTX.session_file if _SESSION_CTX is not None else LEGACY_SESSION_FILE
+
+
+def _current_ui_state_file() -> Path:
+    return _SESSION_CTX.ui_state_file if _SESSION_CTX is not None else (LEGACY_SESSION_FILE.parent / "ui_state.json")
+
+
+def _current_event_log_file() -> Path:
+    return _SESSION_CTX.event_log_file if _SESSION_CTX is not None else (LEGACY_SESSION_FILE.parent / "events.jsonl")
+
+
+class _ShellLayoutSlot:
+    def __init__(self, ui: "InteractiveShellUI", name: str):
+        self.ui = ui
+        self.name = name
+
+    def update(self, renderable) -> None:
+        self.ui.update_renderable(self.name, renderable)
+
+
+class _ShellLayoutProxy:
+    def __init__(self, ui: "InteractiveShellUI", mode: str):
+        self.ui = ui
+        self.mode = mode
+
+    def __getitem__(self, name: str) -> _ShellLayoutSlot:
+        return _ShellLayoutSlot(self.ui, name)
+
+
+class _ShellLiveProxy:
+    def __init__(self, ui: "InteractiveShellUI"):
+        self.ui = ui
+        self._started = False
+
+    def start(self) -> None:
+        self._started = True
+        self.ui.set_busy(True)
+        self.ui.invalidate()
+
+    def stop(self) -> None:
+        self._started = False
+        self.ui.set_busy(False)
+        self.ui.invalidate()
+
+
 console = Console()
+_raw_console = console  # TuiAwareConsole로 덮기 전 원본 참조
+_IS_SSH = bool(os.getenv('SSH_CLIENT') or os.getenv('SSH_TTY') or os.getenv('SSH_CONNECTION'))
 _last_session: dict | None = None        # {goal, history, eval_history, workdir}
 _interrupt_event = threading.Event()     # ESC 감지 플래그
 _active_procs: set = set()               # 실행 중인 서브프로세스 추적
@@ -353,7 +449,6 @@ _HYPOTHESIS_RE = re.compile(r'^HYPOTHESIS:\s*(.+?)$', re.I | re.M)
 def _persist_session(session: dict) -> None:
     """세션을 디스크에 저장. worker_lines는 TUI 표시용이라 제외."""
     try:
-        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
         def _slim(hist):
             return [{k: v for k, v in h.items() if k != 'worker_lines'} for h in hist]
         data = dict(session)
@@ -363,7 +458,8 @@ def _persist_session(session: dict) -> None:
         else:
             data['history'] = _slim(session.get('history', []))
         data['saved_at'] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        SESSION_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        data['session_key'] = _SESSION_CTX.key if _SESSION_CTX is not None else "legacy"
+        _write_json_atomic(_current_session_file(), data)
     except Exception:
         pass
 
@@ -371,9 +467,13 @@ def _persist_session(session: dict) -> None:
 def _load_persisted_session() -> dict | None:
     """디스크에서 세션 로드. 실패 시 None."""
     try:
-        if not SESSION_FILE.exists():
-            return None
-        data = json.loads(SESSION_FILE.read_text())
+        path = _current_session_file()
+        if not path.exists():
+            if LEGACY_SESSION_FILE.exists():
+                path = LEGACY_SESSION_FILE
+            else:
+                return None
+        data = json.loads(path.read_text())
         # worker_lines 누락된 항목 복원
         if data.get("mode") == "dual":
             for key in ('history1', 'history2'):
@@ -385,6 +485,37 @@ def _load_persisted_session() -> dict | None:
         return data
     except Exception:
         return None
+
+
+def _persist_ui_state(state: dict) -> None:
+    try:
+        payload = dict(state)
+        payload["saved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        payload["session_key"] = _SESSION_CTX.key if _SESSION_CTX is not None else "legacy"
+        _write_json_atomic(_current_ui_state_file(), payload)
+    except Exception:
+        pass
+
+
+def _load_ui_state() -> dict | None:
+    try:
+        path = _current_ui_state_file()
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def _append_session_event(kind: str, **payload) -> None:
+    try:
+        _append_jsonl(_current_event_log_file(), {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "kind": kind,
+            **payload,
+        })
+    except Exception:
+        pass
 _current_responses: list = []            # 현재 스트리밍 HTTP 응답 목록 (즉시 끊기용)
 _current_responses_lock = threading.Lock()
 
@@ -857,7 +988,7 @@ SLASH_COMMANDS = [
     ("/wandb",           "wandb 연동 상태 확인"),
     ("/report",          "현재 목표의 실험 리포트 출력"),
     ("/paper <url>",     "arXiv/논문 URL → 코드 자동 구현 목표 설정"),
-    ("/mcp list",        "연결된 MCP 서버 및 툴 목록"),
+    ("/mcp list",          "연결된 MCP 서버 및 툴 목록"),
     ("/mcp install <pkg>", "MCP 서버 설치 및 등록 (예: @playwright/mcp)"),
     ("/mcp remove <name>", "MCP 서버 제거"),
     ("/help",            "커맨드 목록 표시"),
@@ -926,6 +1057,438 @@ PROMPT_STYLE = PtStyle.from_dict({
     'completion-menu.meta.completion.current':  'bg:#313244 #bac2de',
 })
 
+class InteractiveShellUI:
+    """Fullscreen shell with persistent panel state and bottom composer."""
+
+    def __init__(self, app_name: str = "AgentForge"):
+        restored = _load_ui_state() or {}
+        self.app_name = app_name
+        self._lock = threading.RLock()
+        self._panel_mode = restored.get("panel_mode", "single")
+        self._renderables: dict[str, object] = {}
+        self._render_version = 0
+        self._top_cache_key: tuple | None = None
+        self._top_cache_text = restored.get("top_cache_text", "")
+        self._notices: deque[str] = deque(restored.get("notices", []), maxlen=80)
+        self._pending_queue: queue.Queue | None = None
+        self._command_queue: queue.Queue = queue.Queue()
+        self._closed = False
+        self._busy = restored.get("busy", False)
+        self._default_prompt = '\x1b[36m\x1b[1m[agentforge]\x1b[0m \x1b[37m>\x1b[0m '
+        self._composer_prompt = restored.get("composer_prompt", self._default_prompt)
+        self._empty_text = to_formatted_text("")
+        self._last_ui_persist = 0.0
+
+        draft_text = restored.get("draft_text", "")
+        draft_cursor = min(len(draft_text), restored.get("draft_cursor", len(draft_text)))
+
+        self.input_field = TextArea(
+            text=draft_text,
+            multiline=True,
+            wrap_lines=True,
+            prompt=self._get_prompt_fragments,
+            completer=SlashCompleter(),
+            complete_while_typing=False,
+            accept_handler=self._accept_input,
+            height=D(min=1, max=6),
+            scrollbar=False,
+            style="class:composer",
+        )
+        self.input_field.buffer.set_document(
+            Document(draft_text, cursor_position=draft_cursor),
+            bypass_readonly=True,
+        )
+        self.input_field.complete_while_typing = Condition(
+            lambda: self.input_field.buffer.text.lstrip().startswith("/")
+        )
+        self.input_field.buffer.on_text_changed += self._on_buffer_change
+        self.input_field.buffer.on_cursor_position_changed += self._on_buffer_change
+
+        self._top_control = FormattedTextControl(text=self._empty_text, focusable=False, show_cursor=False)
+        self._notice_control = FormattedTextControl(text=self._empty_text, focusable=False, show_cursor=False)
+        self._composer_title_control = FormattedTextControl(text=self._empty_text, focusable=False, show_cursor=False)
+
+        self._kb = KeyBindings()
+        self._install_keybindings()
+
+        self._notice_container = ConditionalContainer(
+            content=Frame(
+                Window(
+                    content=self._notice_control,
+                    wrap_lines=True,
+                    always_hide_cursor=True,
+                    style="class:notices.body",
+                ),
+                title="system",
+                style="class:notices",
+            ),
+            filter=Condition(lambda: bool(self._notices)),
+        )
+        self._composer_container = Frame(
+            HSplit(
+                [
+                    Window(
+                        content=self._composer_title_control,
+                        height=D.exact(1),
+                        always_hide_cursor=True,
+                        style="class:composer.title",
+                    ),
+                    self.input_field,
+                ]
+            ),
+            style="class:composer.frame",
+        )
+        body = HSplit(
+            [
+                Window(
+                    content=self._top_control,
+                    wrap_lines=False,
+                    always_hide_cursor=True,
+                    style="class:screen",
+                ),
+                self._notice_container,
+                self._composer_container,
+            ]
+        )
+        root = FloatContainer(
+            content=body,
+            floats=[
+                Float(
+                    content=CompletionsMenu(
+                        max_height=8,
+                        scroll_offset=1,
+                        extra_filter=has_focus(self.input_field.buffer),
+                    ),
+                    xcursor=True,
+                    ycursor=True,
+                    attach_to_window=self.input_field.window,
+                    allow_cover_cursor=False,
+                )
+            ],
+        )
+        self.app = Application(
+            layout=PtLayout(root, focused_element=self.input_field),
+            full_screen=True,
+            key_bindings=self._kb,
+            mouse_support=False,
+            min_redraw_interval=0.03,
+            max_render_postpone_time=0.03,
+            before_render=self._before_render,
+            style=PtStyle.from_dict({
+                "screen": "bg:#0f1115 #e7e7e7",
+                "composer.frame": "bg:#0f1115 #e7e7e7",
+                "composer.title": "bg:#181c23 #8ea2c0",
+                "composer": "bg:#131721 #f4f4f0",
+                "text-area.prompt": "#8bd5ca bold",
+                "notices": "bg:#0f1115",
+                "notices.body": "bg:#11161d #c5cad3",
+                "frame.border": "#394150",
+                "frame.label": "#d5dbe3 bold",
+                "completion-menu.completion": "bg:#151922 #cfd6df",
+                "completion-menu.completion.current": "bg:#2a3140 #ffffff bold",
+                "completion-menu.meta.completion": "bg:#151922 #7f8792",
+                "completion-menu.meta.completion.current": "bg:#2a3140 #dce3ed",
+            }),
+        )
+
+        self._refresh_notice_control()
+        self._refresh_composer_title()
+        self._set_control_text(self._top_control, self._top_cache_text)
+        self._persist_ui_state(force=True)
+
+    def _install_keybindings(self) -> None:
+        @self._kb.add("enter", filter=has_focus(self.input_field.buffer))
+        def _submit(event):
+            buf = event.current_buffer
+            if buf.complete_state and buf.complete_state.current_completion:
+                buf.apply_completion(buf.complete_state.current_completion)
+                return
+            buf.validate_and_handle()
+
+        @self._kb.add("escape", "enter", filter=has_focus(self.input_field.buffer))
+        def _newline(event):
+            event.current_buffer.insert_text("\n")
+
+        @self._kb.add("/", filter=has_focus(self.input_field.buffer))
+        def _slash(event):
+            buf = event.current_buffer
+            buf.insert_text("/")
+            if buf.text.lstrip().startswith("/"):
+                buf.start_completion(select_first=False)
+
+        @self._kb.add("tab", filter=has_focus(self.input_field.buffer))
+        def _tab_complete(event):
+            buf = event.current_buffer
+            if buf.complete_state and buf.complete_state.current_completion:
+                buf.apply_completion(buf.complete_state.current_completion)
+                return
+            if buf.text.lstrip().startswith("/"):
+                buf.start_completion(select_first=False)
+                return
+            buf.insert_text("    ")
+
+        @self._kb.add("c-c", filter=has_focus(self.input_field.buffer))
+        def _interrupt(event):
+            if self._pending_queue is not None:
+                self._pending_queue.put(KeyboardInterrupt)
+                event.current_buffer.reset()
+                self.invalidate()
+
+        @self._kb.add("c-d", filter=has_focus(self.input_field.buffer))
+        def _eof(event):
+            if self._pending_queue is not None and not event.current_buffer.text:
+                self._pending_queue.put(EOFError)
+                self.invalidate()
+                return
+            if not event.current_buffer.text:
+                self.request_exit()
+
+    def run(self) -> None:
+        try:
+            self.app.run()
+        finally:
+            self._closed = True
+
+    def request_exit(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        with self._lock:
+            pending = self._pending_queue
+        if pending is not None:
+            pending.put(EOFError)
+        self._command_queue.put(EOFError)
+        try:
+            self.app.exit()
+        except Exception:
+            pass
+
+    def invalidate(self) -> None:
+        try:
+            self.app.invalidate()
+        except Exception:
+            pass
+
+    def _set_control_text(self, control: FormattedTextControl, text: str) -> None:
+        control.text = self._empty_text if not text else to_formatted_text(ANSI(text))
+
+    def render_width(self) -> int:
+        try:
+            return max(80, self.app.output.get_size().columns)
+        except Exception:
+            return 120
+
+    def set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self._refresh_composer_title()
+        self._persist_ui_state()
+
+    def add_notice(self, text: str) -> None:
+        if not text:
+            return
+        with self._lock:
+            for line in text.rstrip().splitlines():
+                if line.strip():
+                    self._notices.append(line)
+                    _append_session_event("notice", line=line)
+        self._refresh_notice_control()
+        self._persist_ui_state()
+        self.invalidate()
+
+    def clear_notices(self) -> None:
+        with self._lock:
+            self._notices.clear()
+        self._refresh_notice_control()
+        self._persist_ui_state(force=True)
+        self.invalidate()
+
+    def activate_mode(self, mode: str) -> _ShellLayoutProxy:
+        with self._lock:
+            self._panel_mode = mode
+            self._render_version += 1
+            if mode == "single":
+                self._renderables.pop("summary_bar", None)
+                self._renderables.pop("worker1", None)
+                self._renderables.pop("worker2", None)
+            else:
+                self._renderables.pop("worker", None)
+        self._persist_ui_state()
+        self.invalidate()
+        return _ShellLayoutProxy(self, mode)
+
+    def create_live_proxy(self) -> _ShellLiveProxy:
+        return _ShellLiveProxy(self)
+
+    def update_renderable(self, name: str, renderable) -> None:
+        with self._lock:
+            self._renderables[name] = renderable
+            self._render_version += 1
+        self.invalidate()
+
+    def read_input(self, prompt: str = "", default: str = "") -> str:
+        if self._closed:
+            raise EOFError
+        response_q: queue.Queue = queue.Queue(maxsize=1)
+        with self._lock:
+            self._pending_queue = response_q
+            self._composer_prompt = prompt or self._default_prompt
+            self.input_field.buffer.set_document(
+                Document(default, cursor_position=len(default)),
+                bypass_readonly=True,
+            )
+            self.app.layout.focus(self.input_field)
+        self._refresh_composer_title()
+        self._persist_ui_state(force=True)
+        self.invalidate()
+
+        result = response_q.get()
+
+        with self._lock:
+            self._pending_queue = None
+            self._composer_prompt = self._default_prompt
+            self.input_field.buffer.reset(Document())
+        self._refresh_composer_title()
+        self._persist_ui_state(force=True)
+        self.invalidate()
+
+        if result is KeyboardInterrupt:
+            raise KeyboardInterrupt
+        if result is EOFError:
+            raise EOFError
+        return str(result)
+
+    def get_command(self):
+        result = self._command_queue.get()
+        if result is EOFError:
+            raise EOFError
+        return str(result)
+
+    def _accept_input(self, buffer) -> bool:
+        text = buffer.text
+        with self._lock:
+            target = self._pending_queue
+        if target is not None:
+            target.put(text)
+        else:
+            self._command_queue.put(text)
+            _append_session_event("command", text=text)
+        buffer.reset(Document())
+        self._persist_ui_state(force=True)
+        return True
+
+    def _on_buffer_change(self, _event=None) -> None:
+        self._persist_ui_state()
+
+    def _composer_line_count(self) -> int:
+        text = self.input_field.buffer.text or ""
+        return min(6, max(1, text.count("\n") + 1))
+
+    def _notice_line_count(self) -> int:
+        with self._lock:
+            if not self._notices:
+                return 0
+            return min(8, max(3, len(self._notices)))
+
+    def _top_height(self) -> int:
+        try:
+            total_rows = self.app.output.get_size().rows
+        except Exception:
+            total_rows = 40
+        composer_rows = self._composer_line_count() + 4
+        notice_rows = self._notice_line_count() + (2 if self._notices else 0)
+        return max(12, total_rows - composer_rows - notice_rows)
+
+    def _build_shell_renderable(self):
+        top_rows = self._top_height()
+        with self._lock:
+            renderables = dict(self._renderables)
+            mode = self._panel_mode
+        if mode == "dual":
+            layout = make_dual_layout(term_rows=top_rows)
+            for key in ("header", "summary_bar", "worker1", "worker2", "evaluator", "cmd_bar"):
+                layout[key].update(renderables.get(key, ""))
+        else:
+            layout = make_layout(term_rows=top_rows)
+            for key in ("header", "worker", "evaluator", "cmd_bar"):
+                layout[key].update(renderables.get(key, ""))
+        return layout
+
+    def _refresh_top_display(self, force: bool = False) -> None:
+        width = self.render_width()
+        top_height = self._top_height()
+        with self._lock:
+            cache_key = (self._panel_mode, self._render_version, width, top_height)
+            if not force and cache_key == self._top_cache_key:
+                return
+            renderable = self._build_shell_renderable()
+            self._top_cache_text = _capture_rich_text(renderable, width=width, height=top_height)
+            self._top_cache_key = cache_key
+            text = self._top_cache_text
+        self._set_control_text(self._top_control, text)
+        self._persist_ui_state()
+
+    def _refresh_notice_control(self) -> None:
+        with self._lock:
+            text = "\n".join(list(self._notices)[-8:])
+        self._set_control_text(self._notice_control, text)
+
+    def _refresh_composer_title(self) -> None:
+        state = "RUNNING" if self._busy else "READY"
+        hint = "Enter send  Esc+Enter newline  / for commands  -r reconnect"
+        self._set_control_text(
+            self._composer_title_control,
+            f"\x1b[38;2;142;162;192m {self.app_name.upper()}  {state} \x1b[0m"
+            f"\x1b[38;2;120;128;140m  {hint}\x1b[0m"
+        )
+
+    def _persist_ui_state(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self._last_ui_persist < 0.15:
+            return
+        self._last_ui_persist = now
+        with self._lock:
+            state = {
+                "panel_mode": self._panel_mode,
+                "top_cache_text": self._top_cache_text,
+                "notices": list(self._notices),
+                "draft_text": self.input_field.buffer.text,
+                "draft_cursor": self.input_field.buffer.cursor_position,
+                "composer_prompt": self._composer_prompt,
+                "busy": self._busy,
+            }
+        _persist_ui_state(state)
+
+    def _before_render(self, _app) -> None:
+        self._refresh_top_display()
+
+    def _get_prompt_fragments(self):
+        return ANSI(self._composer_prompt)
+
+
+
+
+class TuiAwareConsole:
+    def __init__(self, base_console: Console):
+        self._base_console = base_console
+
+    def print(self, *objects, **kwargs):
+        if _ACTIVE_UI is None:
+            return self._base_console.print(*objects, **kwargs)
+        width = _ACTIVE_UI.render_width()
+        _ACTIVE_UI.add_notice(_capture_rich_text(*objects, width=width, **kwargs))
+
+    def clear(self):
+        if _ACTIVE_UI is None:
+            return self._base_console.clear()
+        _ACTIVE_UI.clear_notices()
+
+    def __getattr__(self, name):
+        return getattr(self._base_console, name)
+
+
+_ACTIVE_UI: InteractiveShellUI | None = None
+console = TuiAwareConsole(console)
+
 # ── Output colorizer ──────────────────────────────────────────────────────────
 
 def colorize_line(line: str) -> str:
@@ -958,6 +1521,19 @@ def colorize_line(line: str) -> str:
 
 def strip_ansi(text: str) -> str:
     return ANSI_RE.sub('', text)
+
+
+def safe_input(prompt: str = "", default: str = "") -> str:
+    if _ACTIVE_UI is not None:
+        return _ACTIVE_UI.read_input(prompt=prompt, default=default)
+    if prompt:
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+    value = sys.stdin.readline()
+    if value == "":
+        raise EOFError
+    text = value.rstrip("\r\n")
+    return text if text else default
 
 
 # ── Prompt Templates ──────────────────────────────────────────────────────────
@@ -2197,9 +2773,9 @@ def parse_decision(text: str) -> tuple[str, str]:
 
 # ── TUI ───────────────────────────────────────────────────────────────────────
 
-def make_layout() -> Layout:
+def make_layout(term_rows: int | None = None) -> Layout:
     import shutil
-    term_h = shutil.get_terminal_size(fallback=(80, 40)).lines
+    term_h = term_rows or shutil.get_terminal_size(fallback=(80, 40)).lines
     body_size = max(10, term_h - 11)  # header(5) + cmd_bar(3) + 여백(3)
 
     layout = Layout()
@@ -2215,9 +2791,9 @@ def make_layout() -> Layout:
     return layout
 
 
-def make_dual_layout() -> Layout:
+def make_dual_layout(term_rows: int | None = None) -> Layout:
     import shutil
-    term_h = shutil.get_terminal_size(fallback=(80, 40)).lines
+    term_h = term_rows or shutil.get_terminal_size(fallback=(80, 40)).lines
     body_size = max(10, term_h - 13)  # header(5) + summary_bar(3) + cmd_bar(3) + margin(2)
     layout = Layout()
     layout.split(
@@ -2314,9 +2890,19 @@ _DECISION_BADGE = {
 }
 
 # 파일 경로 패턴 (절대경로 or ./상대경로)
+_PATH_RE = re.compile(r'(/[\w./\-_@:~가-힣]+(?:\.\w+)?|\.{1,2}/[\w./\-_@:~가-힣]+(?:\.\w+)?)')
+
 def _osc8_linkify(text: str) -> str:
-    """OSC 8 하이퍼링크 비활성화 — SSH 환경에서 escape 시퀀스가 Ctrl 키 충돌 유발."""
-    return text
+    if _IS_SSH:
+        return text  # SSH 환경: OSC 8 이스케이프 사용 안 함 (터미널 손상 방지)
+    def replace(m):
+        path = m.group(0)
+        p = Path(path).expanduser()
+        if p.exists():
+            uri = f"file://{p.resolve()}"
+            return f"\x1b]8;;{uri}\x1b\\{path}\x1b]8;;\x1b\\"
+        return path
+    return _PATH_RE.sub(replace, text)
 
 def render_worker_panel(buf: deque, iteration: int, status: str,
                         history: list, done: bool, label: str = "WORKER") -> Panel:
@@ -2445,22 +3031,38 @@ def render_dual_evaluator_panel(eval_history1: list, eval_history2: list,
 import shlex as _shlex
 import shutil as _shutil
 
-TMUX_SESSION = "agentforge"
-
-
 def _in_tmux() -> bool:
     return bool(os.environ.get("TMUX"))
 
 
-def _tmux_session_exists() -> bool:
-    r = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION],
+def _resolve_cli_workdir(argv: list[str]) -> str:
+    workdir = "."
+    for i, arg in enumerate(argv):
+        if arg == "-d" and i + 1 < len(argv):
+            workdir = argv[i + 1]
+            break
+        if arg.startswith("--dir="):
+            workdir = arg.split("=", 1)[1]
+            break
+        if arg == "--dir" and i + 1 < len(argv):
+            workdir = argv[i + 1]
+            break
+    return str(Path(workdir).expanduser().resolve())
+
+
+def _tmux_session_name_for_workdir(workdir: str) -> str:
+    return SessionContext(workdir).tmux_session
+
+
+def _tmux_session_exists(session_name: str) -> bool:
+    r = subprocess.run(["tmux", "has-session", "-t", session_name],
                        capture_output=True)
     return r.returncode == 0
 
 
-def _tmux_launch(extra_args: list):
+def _tmux_launch(extra_args: list, session_name: str):
     """현재 프로세스를 tmux 세션 안의 agentforge로 교체."""
-    if _tmux_session_exists():
+    if _tmux_session_exists(session_name):
         console.print(
             f"[yellow]이미 실행 중인 agentforge 세션이 있습니다.[/yellow]\n"
             f"  재접속:  [cyan]agentforge -r[/cyan]\n"
@@ -2471,23 +3073,24 @@ def _tmux_launch(extra_args: list):
     exe = _shutil.which("agentforge") or os.path.abspath(sys.argv[0])
     cmd_str = " ".join(_shlex.quote(p) for p in [exe] + extra_args)
     try:
-        os.execvp("tmux", ["tmux", "new-session", "-s", TMUX_SESSION, cmd_str])
+        os.execvp("tmux", ["tmux", "new-session", "-s", session_name, cmd_str])
     except OSError:
         pass  # tmux 실행 실패 → 그냥 일반 모드로 계속
 
 
-def _tmux_reconnect():
+def _tmux_reconnect(workdir: str):
     """기존 agentforge tmux 세션에 재접속."""
+    session_name = _tmux_session_name_for_workdir(workdir)
     if not _shutil.which("tmux"):
         console.print("[red]tmux가 설치되지 않았습니다.[/red]")
         sys.exit(1)
-    if not _tmux_session_exists():
+    if not _tmux_session_exists(session_name):
         console.print(
             "[yellow]실행 중인 agentforge 세션이 없습니다.[/yellow]\n"
             "새 세션 시작: [cyan]agentforge[/cyan]"
         )
         sys.exit(1)
-    os.execvp("tmux", ["tmux", "attach-session", "-t", TMUX_SESSION])
+    os.execvp("tmux", ["tmux", "attach-session", "-t", session_name])
 
 
 # ── Checkpoint / Rollback ────────────────────────────────────────────────────
@@ -2898,7 +3501,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
     worker_sys   = RESEARCH_WORKER_SYSTEM if mode == "research" else WORKER_SYSTEM
     eval_sys     = RESEARCH_EVALUATOR_SYSTEM if mode == "research" else EVALUATOR_SYSTEM
     base_tools   = RESEARCH_TOOLS if mode == "research" else WORKER_TOOLS
-    active_tools = base_tools + _mcp_all_tools()
+    active_tools = base_tools + ([] if _IS_SSH else _mcp_all_tools())
 
     # 압축 상태 — 백그라운드 압축 스레드 결과 수신용
     _compress_result: list[list] = []   # [new_history] 채워지면 완료
@@ -3236,7 +3839,7 @@ def run_dual_agent_loop(
     current_task_b = task_b
 
     worker_sys = RESEARCH_WORKER_SYSTEM if mode == "research" else WORKER_SYSTEM
-    active_tools = (RESEARCH_TOOLS if mode == "research" else WORKER_TOOLS) + _mcp_all_tools()
+    active_tools = (RESEARCH_TOOLS if mode == "research" else WORKER_TOOLS) + ([] if _IS_SSH else _mcp_all_tools())
 
     past_attempts1 = _load_past_attempts(task_a)
     past_attempts2 = _load_past_attempts(task_b)
@@ -3468,18 +4071,15 @@ def run_dual_agent_loop(
             console.print()
 
             try:
-                choice_str = PromptSession(style=PROMPT_STYLE, mouse_support=False).prompt(
-                    HTML('<ansiyellow>선택 (번호)</ansiyellow> <ansiwhite>></ansiwhite> ')
-                ).strip()
+                choice_str = safe_input('\x1b[33m선택 (번호)\x1b[0m \x1b[37m>\x1b[0m ').strip()
                 choice = int(choice_str)
             except (ValueError, EOFError, KeyboardInterrupt):
                 choice = -1
 
             if choice == 0:
                 try:
-                    user_instruction = PromptSession(style=PROMPT_STYLE, mouse_support=False).prompt(
-                        HTML(f'<ansicyan>Worker {rw} 에게 내릴 명령</ansicyan> '
-                             f'<ansiwhite>></ansiwhite> ')
+                    user_instruction = safe_input(
+                        f'\x1b[36mWorker {rw} 에게 내릴 명령\x1b[0m \x1b[37m>\x1b[0m '
                     ).strip()
                 except (EOFError, KeyboardInterrupt):
                     user_instruction = ""
@@ -3571,6 +4171,54 @@ def run_dual_agent_loop(
     return _finish('max')
 
 
+def _prepare_single_shell(
+    ui: InteractiveShellUI,
+    goal: str,
+    max_iter: int,
+    iteration: int = 0,
+    history: list | None = None,
+    eval_history: list | None = None,
+):
+    layout = ui.activate_mode("single")
+    layout["header"].update(render_header(goal, iteration, max_iter, "idle"))
+    layout["worker"].update(render_worker_panel(
+        deque(), iteration, "idle", history or [], False
+    ))
+    layout["evaluator"].update(render_evaluator_panel(
+        eval_history or [], iteration, "idle", False
+    ))
+    layout["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
+    return layout, ui.create_live_proxy()
+
+
+def _prepare_dual_shell(
+    ui: InteractiveShellUI,
+    goal: str,
+    max_iter: int,
+    task_a: str,
+    task_b: str,
+    iteration: int = 0,
+    history1: list | None = None,
+    history2: list | None = None,
+    eval_history1: list | None = None,
+    eval_history2: list | None = None,
+):
+    layout = ui.activate_mode("dual")
+    layout["header"].update(render_header(goal, iteration, max_iter, "idle"))
+    layout["summary_bar"].update(render_summary_bar(task_a, task_b, "idle", "idle"))
+    layout["worker1"].update(render_worker_panel(
+        deque(), iteration, "idle", history1 or [], False, label="WORKER 1"
+    ))
+    layout["worker2"].update(render_worker_panel(
+        deque(), iteration, "idle", history2 or [], False, label="WORKER 2"
+    ))
+    layout["evaluator"].update(render_dual_evaluator_panel(
+        eval_history1 or [], eval_history2 or [], iteration, "idle", False, False
+    ))
+    layout["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
+    return layout, ui.create_live_proxy()
+
+
 # ── Interrupt Handler ─────────────────────────────────────────────────────────
 
 def _handle_interrupt(goal: str, workdir: str, args, max_iter: int) -> str:
@@ -3583,8 +4231,8 @@ def _handle_interrupt(goal: str, workdir: str, args, max_iter: int) -> str:
         "목표를 수정하거나 Enter로 재실행, Ctrl+C로 REPL 복귀:"
     )
     try:
-        new_goal = PromptSession(style=PROMPT_STYLE).prompt(
-            HTML('<ansiyellow><b>목표 수정</b></ansiyellow> <ansiwhite>></ansiwhite> '),
+        new_goal = safe_input(
+            '\x1b[33m\x1b[1m목표 수정\x1b[0m \x1b[37m>\x1b[0m ',
             default=goal,
         ).strip()
     except (EOFError, KeyboardInterrupt):
@@ -3594,12 +4242,7 @@ def _handle_interrupt(goal: str, workdir: str, args, max_iter: int) -> str:
     if not new_goal:
         new_goal = goal  # Enter만 누르면 동일 목표 재실행
 
-    layout2 = make_layout()
-    layout2["header"].update(render_header(new_goal, 0, max_iter, "idle"))
-    layout2["worker"].update(render_worker_panel(deque(), 0, "idle", [], False))
-    layout2["evaluator"].update(render_evaluator_panel([], 0, "idle", False))
-    layout2["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
-    live2 = Live(layout2, refresh_per_second=8, screen=False)
+    layout2, live2 = _prepare_single_shell(_ACTIVE_UI, new_goal, max_iter)
 
     # 목표가 바뀌면 히스토리 없이 fresh 실행
     outcome = run_agent_loop(
@@ -3616,22 +4259,408 @@ def _handle_interrupt(goal: str, workdir: str, args, max_iter: int) -> str:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _interactive_controller(args, workdir: str, max_iter: int, ui: InteractiveShellUI) -> None:
+    global _last_session
+
+    current_mode = args.mode
+    eval_every = args.eval_every
+    current_goal = ""
+    _session_summaries: list[dict] = []
+
+    def _record_session_summary(outcome: str, fallback_goal: str) -> None:
+        if outcome == "interrupted" or not _last_session:
+            return
+        sess = _last_session
+        if sess.get("mode") == "dual":
+            iter_count = max(len(sess.get("history1", [])), len(sess.get("history2", [])))
+            feedback_parts = []
+            if sess.get("eval_history1"):
+                feedback_parts.append(sess["eval_history1"][-1].get("feedback", ""))
+            if sess.get("eval_history2"):
+                feedback_parts.append(sess["eval_history2"][-1].get("feedback", ""))
+            last_feedback = " | ".join(part for part in feedback_parts if part)
+        else:
+            real_history = [
+                h for h in sess.get("history", [])
+                if h.get("type") != "compressed_summary"
+            ]
+            iter_count = len(real_history)
+            last_feedback = next(
+                (
+                    h.get("feedback", "")
+                    for h in reversed(real_history)
+                    if h.get("decision") in ("IMPROVE", "REDIRECT", "DONE")
+                ),
+                "",
+            )
+        _session_summaries.append({
+            "goal": sess.get("goal", fallback_goal),
+            "outcome": outcome,
+            "iter_count": iter_count,
+            "last_feedback": last_feedback,
+        })
+
+    def _report_outcome(outcome: str) -> None:
+        if outcome == "interrupted":
+            console.print("[yellow]⚠  중단됨. REPL로 돌아갑니다.[/yellow]")
+            return
+        if outcome == "max":
+            console.print(f"[red]{max_iter}번 반복 후에도 완료되지 않았습니다.[/red]")
+        console.print("[dim]다음 명령을 입력하세요. /exit 로 종료.[/dim]")
+
+    def _run_single_goal(
+        goal_text: str,
+        initial_history: list | None = None,
+        initial_eval_history: list | None = None,
+    ) -> str:
+        iteration = len(initial_history or [])
+        layout2, live2 = _prepare_single_shell(
+            ui,
+            goal_text,
+            max_iter,
+            iteration=iteration,
+            history=initial_history,
+            eval_history=initial_eval_history,
+        )
+        return run_agent_loop(
+            goal_text,
+            workdir,
+            args.worker_model,
+            args.eval_model,
+            max_iter,
+            layout2,
+            live2,
+            initial_history=initial_history,
+            initial_eval_history=initial_eval_history,
+            mode=current_mode,
+            eval_every=eval_every,
+            session_context=_session_summaries if _session_summaries else None,
+        )
+
+    def _run_dual_goal(
+        goal_text: str,
+        task_a: str,
+        task_b: str,
+        initial_history1: list | None = None,
+        initial_history2: list | None = None,
+        initial_eval_history1: list | None = None,
+        initial_eval_history2: list | None = None,
+    ) -> str:
+        iteration = max(len(initial_history1 or []), len(initial_history2 or []))
+        layout2, live2 = _prepare_dual_shell(
+            ui,
+            goal_text,
+            max_iter,
+            task_a,
+            task_b,
+            iteration=iteration,
+            history1=initial_history1,
+            history2=initial_history2,
+            eval_history1=initial_eval_history1,
+            eval_history2=initial_eval_history2,
+        )
+        return run_dual_agent_loop(
+            goal_text,
+            task_a,
+            task_b,
+            workdir,
+            args.worker_model,
+            args.eval_model,
+            max_iter,
+            layout2,
+            live2,
+            initial_history1=initial_history1,
+            initial_history2=initial_history2,
+            initial_eval_history1=initial_eval_history1,
+            initial_eval_history2=initial_eval_history2,
+            mode=current_mode,
+            eval_every=eval_every,
+            session_context=_session_summaries if _session_summaries else None,
+        )
+
+    def _run_goal(goal_text: str) -> str:
+        nonlocal current_goal
+        current_goal = goal_text
+        if current_mode == "dual":
+            task_a, task_b = split_goal_to_tasks(goal_text, args.eval_model)
+            outcome = _run_dual_goal(goal_text, task_a, task_b)
+        else:
+            outcome = _run_single_goal(goal_text)
+        _record_session_summary(outcome, goal_text)
+        _report_outcome(outcome)
+        return outcome
+
+    def _resume_saved_session() -> None:
+        nonlocal current_goal
+        if not _last_session:
+            _last_session = _load_persisted_session()
+        if not _last_session:
+            console.print("[yellow]재개할 세션이 없습니다. 먼저 목표를 실행하세요.[/yellow]")
+            return
+
+        sess = _last_session
+        current_goal = sess.get("goal", current_goal)
+        saved_at = sess.get("saved_at", "알 수 없음")
+        console.print(Rule("[cyan]세션 재개[/cyan]"))
+        console.print(f"[dim]목표:[/dim]    [white]{current_goal[:80]}[/white]")
+        console.print(f"[dim]저장:[/dim]    {saved_at}")
+
+        if sess.get("mode") == "dual":
+            prev_iters = max(len(sess.get("history1", [])), len(sess.get("history2", [])))
+            console.print(f"[dim]반복:[/dim]    {prev_iters}회 완료 (듀얼 모드)")
+            console.print(f"[dim]W1 task:[/dim] {sess.get('task_a', '')[:60]}")
+            console.print(f"[dim]W2 task:[/dim] {sess.get('task_b', '')[:60]}")
+            outcome = _run_dual_goal(
+                current_goal,
+                sess.get("task_a", current_goal),
+                sess.get("task_b", current_goal),
+                initial_history1=sess.get("history1"),
+                initial_history2=sess.get("history2"),
+                initial_eval_history1=sess.get("eval_history1"),
+                initial_eval_history2=sess.get("eval_history2"),
+            )
+        else:
+            prev_iters = len(sess.get("history", []))
+            last_decision = next(
+                (
+                    h["decision"]
+                    for h in reversed(sess.get("history", []))
+                    if h.get("decision") and h.get("type") != "compressed_summary"
+                ),
+                "없음",
+            )
+            console.print(f"[dim]반복:[/dim]    {prev_iters}회 완료")
+            console.print(f"[dim]마지막 판정:[/dim] {last_decision}")
+            outcome = _run_single_goal(
+                current_goal,
+                initial_history=sess.get("history"),
+                initial_eval_history=sess.get("eval_history"),
+            )
+
+        _record_session_summary(outcome, current_goal)
+        _report_outcome(outcome)
+
+    status = auth_status()
+    if not status or not status["has_token"]:
+        console.print("[yellow]⚠  로그인되지 않았습니다.[/yellow] y / n / device")
+        try:
+            ans = safe_input(
+                "\x1b[33mlogin\x1b[0m \x1b[37m>\x1b[0m ",
+                default="n",
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans in ("y", ""):
+            cmd_auth_login(device=False)
+        elif ans == "device":
+            cmd_auth_login(device=True)
+        else:
+            console.print(
+                "[dim]로그인을 건너뜁니다. "
+                "agentforge auth login 으로 나중에 로그인할 수 있습니다.[/dim]"
+            )
+
+    console.print(
+        f"[dim]명령을 입력하세요. /help 로 커맨드 목록 확인. "
+        f"모드: {current_mode}[/dim]"
+    )
+
+    try:
+        while True:
+            try:
+                raw = ui.get_command().strip()
+            except EOFError:
+                console.print("[dim]종료합니다.[/dim]")
+                break
+
+            if not raw:
+                continue
+
+            if raw.startswith("/"):
+                token = raw[1:].split(None, 1)
+                cmd_name = token[0].lower() if token else ""
+                cmd_arg = token[1] if len(token) > 1 else ""
+
+                if cmd_name == "exit":
+                    console.print("[dim]종료합니다.[/dim]")
+                    break
+
+                if cmd_name == "resume":
+                    _resume_saved_session()
+                    continue
+
+                if cmd_name == "mode":
+                    if cmd_arg in ("code", "research", "dual", "single"):
+                        current_mode = "code" if cmd_arg == "single" else cmd_arg
+                        if current_mode == "dual":
+                            _prepare_dual_shell(ui, "", max_iter, "", "")
+                            console.print("[dim]Dual 모드: Coordinator가 목표를 W1/W2로 분기합니다.[/dim]")
+                        else:
+                            _prepare_single_shell(ui, "", max_iter)
+                        console.print(f"[cyan]모드 변경: {current_mode}[/cyan]")
+                        console.print(f"[dim]명령을 입력하세요. 모드: {current_mode}[/dim]")
+                    else:
+                        console.print("[red]/mode code|research|dual|single[/red]")
+                    continue
+
+                if cmd_name == "eval-every":
+                    try:
+                        n = int(cmd_arg)
+                        if n < 1:
+                            raise ValueError
+                        eval_every = n
+                        console.print(f"[cyan]Evaluator: {eval_every}번마다 실행[/cyan]")
+                    except ValueError:
+                        console.print("[red]1 이상의 숫자를 입력하세요. 예: /eval-every 3[/red]")
+                    continue
+
+                if cmd_name == "dir":
+                    if not cmd_arg:
+                        console.print(f"현재 작업 디렉토리: [cyan]{workdir}[/cyan]")
+                        console.print("[dim]변경: /dir <경로>  예) /dir ~/AgentForge[/dim]")
+                    else:
+                        new_dir = Path(cmd_arg).expanduser().resolve()
+                        if not new_dir.exists():
+                            console.print(f"[red]존재하지 않는 경로: {new_dir}[/red]")
+                        elif not new_dir.is_dir():
+                            console.print(f"[red]디렉토리가 아닙니다: {new_dir}[/red]")
+                        else:
+                            workdir = str(new_dir)
+                            console.print(f"[cyan]작업 디렉토리 변경: {workdir}[/cyan]")
+                    continue
+
+                if cmd_name == "status":
+                    wandb_str = (
+                        "[green]✓ 연동됨[/green]"
+                        if _WANDB_API_KEY else "[yellow]미연동[/yellow]"
+                    )
+                    console.print(
+                        f"모드: [cyan]{current_mode}[/cyan]  |  "
+                        f"eval-every: [cyan]{eval_every}[/cyan]  |  "
+                        f"dir: [cyan]{workdir}[/cyan]  |  "
+                        f"wandb: {wandb_str}"
+                    )
+                    continue
+
+                if cmd_name == "wandb":
+                    _wandb_status()
+                    continue
+
+                if cmd_name == "report":
+                    _print_report(current_goal)
+                    continue
+
+                if cmd_name == "paper":
+                    if not cmd_arg:
+                        console.print(
+                            "[red]사용법: /paper <url>  예) "
+                            "/paper https://arxiv.org/abs/2312.xxxxx[/red]"
+                        )
+                    else:
+                        paper_goal = _fetch_paper_and_extract(cmd_arg, args.eval_model)
+                        if not paper_goal:
+                            console.print("[red]논문 분석 실패. URL을 확인하거나 직접 목표를 입력하세요.[/red]")
+                        else:
+                            short = paper_goal.split("\n")[0][:80]
+                            console.print("[green]✓ 논문 분석 완료[/green]")
+                            console.print(f"[dim]목표: {short}[/dim]")
+                            _run_goal(paper_goal)
+                    continue
+
+                if cmd_name == "mcp":
+                    if _IS_SSH:
+                        console.print("[yellow]MCP는 로컬 환경에서만 사용 가능합니다.[/yellow]")
+                    else:
+                        sub_cmd, _, sub_arg = (cmd_arg or "").partition(" ")
+                        sub_arg = sub_arg.strip()
+
+                        if sub_cmd == "list" or not sub_cmd:
+                            if not _MCP_REGISTRY:
+                                console.print("[yellow]연결된 MCP 서버 없음[/yellow]")
+                            for sname, client in _MCP_REGISTRY.items():
+                                console.print(f"  [green]●[/green] [cyan]{sname}[/cyan]  port={client.port}  툴 {len(client.tools)}개")
+                                for t in client.tools:
+                                    console.print(f"      [dim]{t['name']}[/dim]")
+
+                        elif sub_cmd == "install":
+                            if not sub_arg:
+                                console.print("[red]사용법: /mcp install <npm패키지>  예) /mcp install @playwright/mcp[/red]")
+                            else:
+                                pkg = sub_arg.strip()
+                                console.print(f"[cyan]설치 중: {pkg}[/cyan]")
+                                r = subprocess.run(
+                                    ["npm", "install", "-g", pkg],
+                                    capture_output=True, text=True
+                                )
+                                if r.returncode != 0:
+                                    console.print(f"[red]설치 실패:[/red]\n{r.stderr[:400]}")
+                                else:
+                                    console.print(f"[green]✓ 설치 완료[/green]")
+                                    # 서버 이름 추론: @scope/name → name, name → name
+                                    sname = pkg.split("/")[-1].replace("-mcp", "").replace("server-", "")
+                                    cmd_list = ["npx", pkg, "--headless"] if "playwright" in pkg else ["npx", pkg]
+                                    # mcp.json 업데이트
+                                    cfg_path = Path.home() / ".agentforge" / "mcp.json"
+                                    try:
+                                        cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {"servers": {}}
+                                    except Exception:
+                                        cfg = {"servers": {}}
+                                    cfg.setdefault("servers", {})[sname] = {"command": cmd_list}
+                                    cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+                                    console.print(f"[dim]~/.agentforge/mcp.json 에 '{sname}' 등록됨[/dim]")
+                                    # 즉시 연결 시도
+                                    client = _MCPClient(sname, cmd_list)
+                                    if client.start():
+                                        _MCP_REGISTRY[sname] = client
+                                        tool_names = [t["name"] for t in client.tools]
+                                        console.print(f"[green]✓ 연결됨 — 툴 {len(tool_names)}개: {', '.join(tool_names[:5])}[/green]")
+                                    else:
+                                        console.print(f"[yellow]설치됐지만 서버 시작 실패. agentforge 재시작 시 자동 연결됩니다.[/yellow]")
+
+                        elif sub_cmd == "remove":
+                            if not sub_arg:
+                                console.print("[red]사용법: /mcp remove <서버이름>[/red]")
+                            else:
+                                sname = sub_arg.strip()
+                                if sname in _MCP_REGISTRY:
+                                    _MCP_REGISTRY[sname].stop()
+                                    del _MCP_REGISTRY[sname]
+                                cfg_path = Path.home() / ".agentforge" / "mcp.json"
+                                if cfg_path.exists():
+                                    try:
+                                        cfg = json.loads(cfg_path.read_text())
+                                        cfg.get("servers", {}).pop(sname, None)
+                                        cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+                                    except Exception:
+                                        pass
+                                console.print(f"[cyan]{sname} 제거됨[/cyan]")
+                        else:
+                            console.print("[red]사용법: /mcp list | /mcp install <pkg> | /mcp remove <name>[/red]")
+                    continue
+
+                if cmd_name == "help":
+                    for cmd, desc in SLASH_COMMANDS:
+                        console.print(f"  [cyan]{cmd:<30}[/cyan] {desc}")
+                    continue
+
+                console.print(f"[red]알 수 없는 커맨드: /{cmd_name}[/red]")
+                console.print("[dim]/help 로 커맨드 목록을 확인하세요.[/dim]")
+                continue
+
+            _run_goal(raw)
+    finally:
+        ui.request_exit()
+
+
 def main():
-    # ── tmux 자동 래핑 ─────────────────────────────────────────────────
-    # -r / --reconnect: 기존 세션 재접속
-    if len(sys.argv) >= 2 and sys.argv[1] in ("-r", "--reconnect"):
-        _tmux_reconnect()
+    argv = sys.argv[1:]
+
+    if argv and argv[0] in ("-r", "--reconnect"):
+        _tmux_reconnect(_resolve_cli_workdir(argv[1:]))
         return
 
-    # --new-session: 기존 세션 무시하고 강제로 새 세션
-    force_new = len(sys.argv) >= 2 and sys.argv[1] == "--new-session"
-    extra_args = [a for a in sys.argv[1:] if a != "--new-session"]
-
-    if not _in_tmux() and _shutil.which("tmux"):
-        if force_new and _tmux_session_exists():
-            subprocess.run(["tmux", "kill-session", "-t", TMUX_SESSION])
-        _tmux_launch(extra_args)
-        # execvp 실패 또는 세션 이미 존재 시 여기까지 옴 → 일반 모드로 계속
+    force_new = "--new-session" in argv
+    cli_args = [arg for arg in argv if arg != "--new-session"]
 
     parser = argparse.ArgumentParser(
         prog="agentforge",
@@ -3643,26 +4672,46 @@ def main():
     auth_sub = auth_parser.add_subparsers(dest="auth_cmd")
 
     login_parser = auth_sub.add_parser("login", help="로그인")
-    login_parser.add_argument("--device", action="store_true",
-        help="SSH/헤드리스 환경용 device auth 사용")
+    login_parser.add_argument(
+        "--device",
+        action="store_true",
+        help="SSH/헤드리스 환경용 device auth 사용",
+    )
     auth_sub.add_parser("logout", help="로그아웃")
     auth_sub.add_parser("status", help="현재 인증 상태 확인")
 
-    parser.add_argument("-d", "--dir", default=".", metavar="DIR",
-                        help="작업 디렉토리 (기본: 현재 디렉토리)")
-    parser.add_argument("--worker-model", default=None, metavar="MODEL",
-                        help="Worker 모델")
-    parser.add_argument("--eval-model", default=None, metavar="MODEL",
-                        help="Evaluator 모델")
-    parser.add_argument("-n", "--max-iterations", type=int, default=DEFAULT_MAX_ITER,
-                        metavar="N", help=f"최대 반복 횟수 (기본: {DEFAULT_MAX_ITER})")
-    parser.add_argument("--mode", choices=["code", "research"], default="code",
-                        help="실행 모드: code(기본) / research(웹 검색·분석)")
-    parser.add_argument("--eval-every", type=int, default=1, metavar="N",
-                        help="N번 반복마다 Evaluator 실행 (기본: 1, 즉 매번)")
-    args = parser.parse_args()
+    parser.add_argument(
+        "-d",
+        "--dir",
+        default=".",
+        metavar="DIR",
+        help="작업 디렉토리 (기본: 현재 디렉토리)",
+    )
+    parser.add_argument("--worker-model", default=None, metavar="MODEL", help="Worker 모델")
+    parser.add_argument("--eval-model", default=None, metavar="MODEL", help="Evaluator 모델")
+    parser.add_argument(
+        "-n",
+        "--max-iterations",
+        type=int,
+        default=DEFAULT_MAX_ITER,
+        metavar="N",
+        help=f"최대 반복 횟수 (기본: {DEFAULT_MAX_ITER})",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["code", "research"],
+        default="code",
+        help="실행 모드: code(기본) / research(웹 검색·분석)",
+    )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=1,
+        metavar="N",
+        help="N번 반복마다 Evaluator 실행 (기본: 1, 즉 매번)",
+    )
+    args = parser.parse_args(cli_args)
 
-    # ── auth 서브커맨드 ────────────────────────────────────────────────
     if args.subcommand == "auth":
         if not CODEX_BIN.exists():
             console.print(f"[red]Error: codex not found at {CODEX_BIN}[/red]")
@@ -3680,384 +4729,43 @@ def main():
     workdir = str(Path(args.dir).resolve())
     max_iter = args.max_iterations
 
-    # ── 초기 TUI 표시 ─────────────────────────────────────────────────
-    layout = make_layout()
-    layout["header"].update(render_header("", 0, max_iter, "idle"))
-    layout["worker"].update(render_worker_panel(deque(), 0, "idle", [], False))
-    layout["evaluator"].update(render_evaluator_panel([], 0, "idle", False))
-    layout["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
-    with Live(layout, refresh_per_second=8, screen=False) as live:
-        time.sleep(0.3)
+    if not _in_tmux() and _shutil.which("tmux"):
+        session_name = _tmux_session_name_for_workdir(workdir)
+        if force_new and _tmux_session_exists(session_name):
+            subprocess.run(["tmux", "kill-session", "-t", session_name])
+        _tmux_launch(cli_args, session_name)
 
-    # ── REPL 루프 ─────────────────────────────────────────────────────
-    status = auth_status()
-    if not status or not status["has_token"]:
-        console.print(
-            "[yellow]⚠  로그인되지 않았습니다.[/yellow] "
-            "지금 로그인하시겠습니까? ([bold]y[/bold]/n/device) ",
-            end="",
-        )
-        try:
-            ans = input().strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            ans = "n"
-        if ans in ("y", ""):
-            cmd_auth_login(device=False)
-        elif ans == "device":
-            cmd_auth_login(device=True)
-        else:
+    _set_session_context(workdir)
+
+    if not _IS_SSH:
+        _mcp_init()
+        if _MCP_REGISTRY:
+            tool_names = [t["name"] for c in _MCP_REGISTRY.values() for t in c.tools]
             console.print(
-                "[dim]로그인을 건너뜁니다. "
-                "agentforge auth login 으로 나중에 로그인할 수 있습니다.[/dim]"
+                f"[dim]🔌 MCP 서버 {len(_MCP_REGISTRY)}개 연결됨 — 툴: "
+                f"{', '.join(tool_names[:6])}{'...' if len(tool_names) > 6 else ''}[/dim]"
             )
+        import atexit
+        atexit.register(_mcp_stop_all)
 
-    global _last_session
-    current_mode = args.mode
-    eval_every   = args.eval_every
-    # _last_session은 /resume 시점에 디스크에서 로드 (기본은 항상 새 시작)
-    # 같은 REPL 세션에서 완료된 목표들의 요약 컨텍스트
-    _session_summaries: list[dict] = []
+    global _ACTIVE_UI
+    _ACTIVE_UI = InteractiveShellUI()
+    _prepare_single_shell(_ACTIVE_UI, "", max_iter)
 
-    # MCP 서버 초기화
-    _mcp_init()
-    if _MCP_REGISTRY:
-        tool_names = [t["name"] for c in _MCP_REGISTRY.values() for t in c.tools]
-        console.print(f"[dim]🔌 MCP 서버 {len(_MCP_REGISTRY)}개 연결됨 — 툴: {', '.join(tool_names[:6])}{'...' if len(tool_names)>6 else ''}[/dim]")
-    import atexit
-    atexit.register(_mcp_stop_all)
-
-    console.print(f"[dim]명령을 입력하세요. /help 로 커맨드 목록 확인. 모드: {current_mode}[/dim]")
-
-    _completer = SlashCompleter()
-    _session = PromptSession(
-        completer=_completer,
-        complete_while_typing=True,
-        style=PROMPT_STYLE,
+    controller = threading.Thread(
+        target=_interactive_controller,
+        args=(args, workdir, max_iter, _ACTIVE_UI),
+        daemon=True,
     )
+    controller.start()
 
-    while True:
-        try:
-            raw = _session.prompt(
-                HTML('<ansicyan><b>[agentforge]</b></ansicyan> <ansiwhite>></ansiwhite> '),
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print("\n[dim]종료합니다.[/dim]")
-            break
-
-        if not raw:
-            continue
-
-        # 슬래시 커맨드 처리
-        if raw.startswith('/'):
-            token = raw[1:].split(None, 1)
-            cmd_name = token[0].lower() if token else ''
-            cmd_arg = token[1] if len(token) > 1 else ''
-
-            if cmd_name == 'exit':
-                console.print("[dim]종료합니다.[/dim]")
-                break
-
-            elif cmd_name == 'resume':
-                if not _last_session:
-                    # 이번 실행에서 아직 세션이 없으면 디스크에서 로드 시도
-                    _last_session = _load_persisted_session()
-                if not _last_session:
-                    console.print("[yellow]재개할 세션이 없습니다. 먼저 목표를 실행하세요.[/yellow]")
-                    continue
-                s = _last_session
-                saved_at = s.get('saved_at', '알 수 없음')
-                console.print(Rule("[cyan]세션 재개[/cyan]"))
-                console.print(f"[dim]목표:[/dim]    [white]{s['goal'][:80]}[/white]")
-                console.print(f"[dim]저장:[/dim]    {saved_at}")
-                console.print()
-                if s.get("mode") == "dual":
-                    prev_iters = max(len(s.get("history1", [])), len(s.get("history2", [])))
-                    console.print(f"[dim]반복:[/dim]    {prev_iters}회 완료 (듀얼 모드)")
-                    console.print(f"[dim]W1 task:[/dim] {s.get('task_a', '')[:60]}")
-                    console.print(f"[dim]W2 task:[/dim] {s.get('task_b', '')[:60]}")
-                    console.print()
-                    layout2 = make_dual_layout()
-                    layout2["header"].update(render_header(s["goal"], prev_iters, max_iter, "idle"))
-                    layout2["summary_bar"].update(render_summary_bar(
-                        s.get("task_a", ""), s.get("task_b", ""), "idle", "idle"))
-                    layout2["worker1"].update(render_worker_panel(
-                        deque(), prev_iters, "idle", s.get("history1", []), False, label="WORKER 1"))
-                    layout2["worker2"].update(render_worker_panel(
-                        deque(), prev_iters, "idle", s.get("history2", []), False, label="WORKER 2"))
-                    layout2["evaluator"].update(render_dual_evaluator_panel(
-                        s.get("eval_history1", []), s.get("eval_history2", []),
-                        prev_iters, "idle", False, False))
-                    layout2["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
-                    live2 = Live(layout2, refresh_per_second=8, screen=False)
-                    outcome = run_dual_agent_loop(
-                        s["goal"], s.get("task_a", s["goal"]), s.get("task_b", s["goal"]),
-                        s["workdir"], args.worker_model, args.eval_model,
-                        max_iter, layout2, live2,
-                        initial_history1=s.get("history1"),
-                        initial_history2=s.get("history2"),
-                        initial_eval_history1=s.get("eval_history1"),
-                        initial_eval_history2=s.get("eval_history2"),
-                        mode=current_mode, eval_every=eval_every,
-                    )
-                else:
-                    prev_iters = len(s.get("history", []))
-                    console.print(f"[dim]반복:[/dim]    {prev_iters}회 완료")
-                    last_decision = next(
-                        (h['decision'] for h in reversed(s.get('history', []))
-                         if h.get('decision') and h.get('type') != 'compressed_summary'),
-                        '없음'
-                    )
-                    console.print(f"[dim]마지막 판정:[/dim] {last_decision}")
-                    console.print()
-                    layout2 = make_layout()
-                    layout2["header"].update(render_header(s["goal"], prev_iters, max_iter, "idle"))
-                    layout2["worker"].update(render_worker_panel(deque(), prev_iters, "idle", s["history"], False))
-                    layout2["evaluator"].update(render_evaluator_panel(s["eval_history"], prev_iters, "idle", False))
-                    layout2["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
-                    live2 = Live(layout2, refresh_per_second=8, screen=False)
-                    outcome = run_agent_loop(
-                        s["goal"], s["workdir"],
-                        args.worker_model, args.eval_model,
-                        max_iter, layout2, live2,
-                        initial_history=s["history"],
-                        initial_eval_history=s["eval_history"],
-                        mode=current_mode, eval_every=eval_every,
-                    )
-                if outcome == 'interrupted':
-                    console.print("\n[yellow]⚠  중단됨. REPL로 돌아갑니다.[/yellow]")
-                elif outcome == 'max':
-                    console.print(f"[red]{max_iter}번 반복 후에도 완료되지 않았습니다.[/red]")
-                if outcome != 'interrupted':
-                    console.print("[dim]다음 명령을 입력하세요. /exit 로 종료.[/dim]")
-
-            elif cmd_name == 'mode':
-                if cmd_arg in ('code', 'research', 'dual', 'single'):
-                    current_mode = 'code' if cmd_arg == 'single' else cmd_arg
-                    # 모드 변경 시 화면 즉시 갱신
-                    console.clear()
-                    if current_mode == 'dual':
-                        _il = make_dual_layout()
-                        _il["header"].update(render_header("", 0, max_iter, "idle"))
-                        _il["summary_bar"].update(render_summary_bar("", "", "idle", "idle"))
-                        _il["worker1"].update(render_worker_panel(deque(), 0, "idle", [], False, label="WORKER 1"))
-                        _il["worker2"].update(render_worker_panel(deque(), 0, "idle", [], False, label="WORKER 2"))
-                        _il["evaluator"].update(render_dual_evaluator_panel([], [], 0, "idle", False, False))
-                        _il["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
-                    else:
-                        _il = make_layout()
-                        _il["header"].update(render_header("", 0, max_iter, "idle"))
-                        _il["worker"].update(render_worker_panel(deque(), 0, "idle", [], False))
-                        _il["evaluator"].update(render_evaluator_panel([], 0, "idle", False))
-                        _il["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
-                    with Live(_il, refresh_per_second=4, screen=False):
-                        time.sleep(0.1)
-                    console.print(f"[cyan]모드 변경: {current_mode}[/cyan]")
-                    if current_mode == 'dual':
-                        console.print("[dim]Dual 모드: Coordinator가 목표를 W1/W2로 분기합니다.[/dim]")
-                    console.print(f"[dim]명령을 입력하세요. 모드: {current_mode}[/dim]")
-                else:
-                    console.print("[red]/mode code|research|dual|single[/red]")
-
-            elif cmd_name == 'eval-every':
-                try:
-                    n = int(cmd_arg)
-                    if n < 1:
-                        raise ValueError
-                    eval_every = n
-                    console.print(f"[cyan]Evaluator: {eval_every}번마다 실행[/cyan]")
-                except ValueError:
-                    console.print("[red]1 이상의 숫자를 입력하세요. 예: /eval-every 3[/red]")
-
-            elif cmd_name == 'dir':
-                if not cmd_arg:
-                    console.print(f"현재 작업 디렉토리: [cyan]{workdir}[/cyan]")
-                    console.print("[dim]변경: /dir <경로>  예) /dir ~/AgentForge[/dim]")
-                else:
-                    new_dir = Path(cmd_arg).expanduser().resolve()
-                    if not new_dir.exists():
-                        console.print(f"[red]존재하지 않는 경로: {new_dir}[/red]")
-                    elif not new_dir.is_dir():
-                        console.print(f"[red]디렉토리가 아닙니다: {new_dir}[/red]")
-                    else:
-                        workdir = str(new_dir)
-                        console.print(f"[cyan]작업 디렉토리 변경: {workdir}[/cyan]")
-
-            elif cmd_name == 'status':
-                wandb_str = f"[green]✓ 연동됨[/green]" if _WANDB_API_KEY else "[yellow]미연동[/yellow]"
-                console.print(
-                    f"모드: [cyan]{current_mode}[/cyan]  |  "
-                    f"eval-every: [cyan]{eval_every}[/cyan]  |  "
-                    f"dir: [cyan]{workdir}[/cyan]  |  "
-                    f"wandb: {wandb_str}"
-                )
-
-            elif cmd_name == 'wandb':
-                _wandb_status()
-
-            elif cmd_name == 'report':
-                _print_report(goal if 'goal' in dir() else "")
-
-            elif cmd_name == 'paper':
-                if not cmd_arg:
-                    console.print("[red]사용법: /paper <url>  예) /paper https://arxiv.org/abs/2312.xxxxx[/red]")
-                else:
-                    paper_goal = _fetch_paper_and_extract(cmd_arg, args.eval_model)
-                    if not paper_goal:
-                        console.print("[red]논문 분석 실패. URL을 확인하거나 직접 목표를 입력하세요.[/red]")
-                    else:
-                        short = paper_goal.split('\n')[0][:80]
-                        console.print(f"[green]✓ 논문 분석 완료[/green]")
-                        console.print(f"[dim]목표: {short}[/dim]")
-                        console.print()
-                        goal = paper_goal
-                        layout2 = make_layout()
-                        layout2["header"].update(render_header(short, 0, max_iter, "idle"))
-                        layout2["worker"].update(render_worker_panel(deque(), 0, "idle", [], False))
-                        layout2["evaluator"].update(render_evaluator_panel([], 0, "idle", False))
-                        layout2["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
-                        live2 = Live(layout2, refresh_per_second=8, screen=False)
-                        outcome = run_agent_loop(
-                            goal, workdir, args.worker_model, args.eval_model,
-                            max_iter, layout2, live2,
-                            mode=current_mode, eval_every=eval_every,
-                        )
-                        if outcome == 'interrupted':
-                            console.print("\n[yellow]⚠  중단됨. REPL로 돌아갑니다.[/yellow]")
-                        elif outcome == 'max':
-                            console.print(f"[red]{max_iter}번 반복 후에도 완료되지 않았습니다.[/red]")
-                        if outcome != 'interrupted':
-                            console.print("[dim]다음 명령을 입력하세요. /exit 로 종료.[/dim]")
-
-            elif cmd_name == 'mcp':
-                sub_cmd, _, sub_arg = (cmd_arg or "").partition(" ")
-                sub_arg = sub_arg.strip()
-
-                if sub_cmd == "list" or not sub_cmd:
-                    if not _MCP_REGISTRY:
-                        console.print("[yellow]연결된 MCP 서버 없음[/yellow]")
-                    for sname, client in _MCP_REGISTRY.items():
-                        console.print(f"  [green]●[/green] [cyan]{sname}[/cyan]  port={client.port}  툴 {len(client.tools)}개")
-                        for t in client.tools:
-                            console.print(f"      [dim]{t['name']}[/dim]")
-
-                elif sub_cmd == "install":
-                    if not sub_arg:
-                        console.print("[red]사용법: /mcp install <npm패키지>  예) /mcp install @playwright/mcp[/red]")
-                    else:
-                        pkg = sub_arg.strip()
-                        console.print(f"[cyan]설치 중: {pkg}[/cyan]")
-                        r = subprocess.run(
-                            ["npm", "install", "-g", pkg],
-                            capture_output=True, text=True
-                        )
-                        if r.returncode != 0:
-                            console.print(f"[red]설치 실패:[/red]\n{r.stderr[:400]}")
-                        else:
-                            console.print(f"[green]✓ 설치 완료[/green]")
-                            # 서버 이름 추론: @scope/name → name, name → name
-                            sname = pkg.split("/")[-1].replace("-mcp", "").replace("server-", "")
-                            cmd_list = ["npx", pkg, "--headless"] if "playwright" in pkg else ["npx", pkg]
-                            # mcp.json 업데이트
-                            cfg_path = Path.home() / ".agentforge" / "mcp.json"
-                            try:
-                                cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {"servers": {}}
-                            except Exception:
-                                cfg = {"servers": {}}
-                            cfg.setdefault("servers", {})[sname] = {"command": cmd_list}
-                            cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
-                            console.print(f"[dim]~/.agentforge/mcp.json 에 '{sname}' 등록됨[/dim]")
-                            # 즉시 연결 시도
-                            client = _MCPClient(sname, cmd_list)
-                            if client.start():
-                                _MCP_REGISTRY[sname] = client
-                                tool_names = [t["name"] for t in client.tools]
-                                console.print(f"[green]✓ 연결됨 — 툴 {len(tool_names)}개: {', '.join(tool_names[:5])}[/green]")
-                            else:
-                                console.print(f"[yellow]설치됐지만 서버 시작 실패. agentforge 재시작 시 자동 연결됩니다.[/yellow]")
-
-                elif sub_cmd == "remove":
-                    if not sub_arg:
-                        console.print("[red]사용법: /mcp remove <서버이름>[/red]")
-                    else:
-                        sname = sub_arg.strip()
-                        if sname in _MCP_REGISTRY:
-                            _MCP_REGISTRY[sname].stop()
-                            del _MCP_REGISTRY[sname]
-                        cfg_path = Path.home() / ".agentforge" / "mcp.json"
-                        if cfg_path.exists():
-                            try:
-                                cfg = json.loads(cfg_path.read_text())
-                                cfg.get("servers", {}).pop(sname, None)
-                                cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
-                            except Exception:
-                                pass
-                        console.print(f"[cyan]{sname} 제거됨[/cyan]")
-                else:
-                    console.print("[red]사용법: /mcp list | /mcp install <pkg> | /mcp remove <name>[/red]")
-
-            elif cmd_name == 'help':
-                for cmd, desc in SLASH_COMMANDS:
-                    console.print(f"  [cyan]{cmd:<30}[/cyan] {desc}")
-
-            else:
-                console.print(f"[red]알 수 없는 커맨드: /{cmd_name}[/red]")
-                console.print("[dim]/help 로 커맨드 목록을 확인하세요.[/dim]")
-
-        else:
-            # 일반 텍스트 → 바로 Worker에게 목표로 전달
-            goal = raw
-            if current_mode == "dual":
-                task_a, task_b = split_goal_to_tasks(goal, args.eval_model)
-                layout2 = make_dual_layout()
-                layout2["header"].update(render_header(goal, 0, max_iter, "idle"))
-                layout2["summary_bar"].update(render_summary_bar(task_a, task_b, "idle", "idle"))
-                layout2["worker1"].update(render_worker_panel(deque(), 0, "idle", [], False, label="WORKER 1"))
-                layout2["worker2"].update(render_worker_panel(deque(), 0, "idle", [], False, label="WORKER 2"))
-                layout2["evaluator"].update(render_dual_evaluator_panel([], [], 0, "idle", False, False))
-                layout2["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
-                live2 = Live(layout2, refresh_per_second=8, screen=False)
-                outcome = run_dual_agent_loop(
-                    goal, task_a, task_b, workdir,
-                    args.worker_model, args.eval_model,
-                    max_iter, layout2, live2,
-                    mode=current_mode, eval_every=eval_every,
-                    session_context=_session_summaries if _session_summaries else None,
-                )
-            else:
-                layout2 = make_layout()
-                layout2["header"].update(render_header(goal, 0, max_iter, "idle"))
-                layout2["worker"].update(render_worker_panel(deque(), 0, "idle", [], False))
-                layout2["evaluator"].update(render_evaluator_panel([], 0, "idle", False))
-                layout2["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
-                live2 = Live(layout2, refresh_per_second=8, screen=False)
-                outcome = run_agent_loop(
-                    goal, workdir, args.worker_model, args.eval_model,
-                    max_iter, layout2, live2,
-                    mode=current_mode, eval_every=eval_every,
-                    session_context=_session_summaries if _session_summaries else None,
-                )
-            # 완료된 세션 요약을 다음 목표를 위해 저장
-            if outcome != 'interrupted' and _last_session:
-                sess = _last_session
-                real_history = [h for h in sess.get("history", [])
-                                if h.get("type") != "compressed_summary"]
-                last_fb = next(
-                    (h.get("feedback", "") for h in reversed(real_history)
-                     if h.get("decision") in ("IMPROVE", "REDIRECT", "DONE")),
-                    ""
-                )
-                _session_summaries.append({
-                    "goal": sess.get("goal", goal),
-                    "outcome": outcome,
-                    "iter_count": len(real_history),
-                    "last_feedback": last_fb,
-                })
-            if outcome == 'interrupted':
-                console.print("\n[yellow]⚠  중단됨. REPL로 돌아갑니다.[/yellow]")
-            elif outcome == 'max':
-                console.print(f"[red]{max_iter}번 반복 후에도 완료되지 않았습니다.[/red]")
-            if outcome != 'interrupted':
-                console.print("[dim]다음 명령을 입력하세요. /exit 로 종료.[/dim]")
+    try:
+        _ACTIVE_UI.run()
+    finally:
+        if _ACTIVE_UI is not None:
+            _ACTIVE_UI.request_exit()
+        controller.join(timeout=2)
+        _ACTIVE_UI = None
 
 
 if __name__ == "__main__":
