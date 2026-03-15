@@ -309,6 +309,10 @@ DECISION_RE = re.compile(
     r'^(DONE|IMPROVE|REDIRECT|CONTINUE|KILL|GPU_PICK)(?::\s*(.*))?$', re.I | re.M)
 _BG_PID_RE  = re.compile(r'^PID:(\d+)\s*$', re.M)
 _BG_LOG_RE  = re.compile(r'^LOG:(.+?)\s*$', re.M)
+
+# shell_background 실행 시 _execute_tool → run_agent_loop 사이드 채널
+_pending_bg_job: "dict | None" = None
+_pending_bg_job_lock = threading.Lock()
 NOISE_RE = re.compile(r'^\s*([\-─═\s]+)?$')
 STAGNATION_THRESHOLD = 3   # N회 연속 정체 시 A/B 전략 발동
 _AB_PICK_RE = re.compile(r'PICK:([AB])', re.I)
@@ -898,6 +902,10 @@ def _execute_tool(name: str, args: dict, workdir: str, worker_id: int = 0) -> st
             proc._agentforge_log_fd = log_fd
             with _active_procs_lock:
                 _active_procs.add(proc)
+            # run_agent_loop이 모니터 루프를 시작할 수 있도록 사이드 채널에 등록
+            global _pending_bg_job
+            with _pending_bg_job_lock:
+                _pending_bg_job = {"pid": proc.pid, "log_path": str(log_path), "proc": proc}
             return f"PID:{proc.pid}\nLOG:{log_path}\n학습이 백그라운드에서 시작됐습니다."
         elif name == "read_file":
             path = Path(args["path"])
@@ -3695,22 +3703,41 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
         })
 
         # ── 백그라운드 학습 job 감지 ─────────────────────────────────────
-        pid_m = _BG_PID_RE.search(last_msg_str)
-        log_m = _BG_LOG_RE.search(last_msg_str)
-        if pid_m and log_m and bg_train is None:
-            bg_pid = int(pid_m.group(1))
-            with _active_procs_lock:
-                bg_proc = next((p for p in _active_procs if p.pid == bg_pid), None)
+        # 1순위: shell_background 사이드 채널 (툴 실행 직후 등록됨)
+        global _pending_bg_job
+        with _pending_bg_job_lock:
+            _side_job = _pending_bg_job
+            _pending_bg_job = None  # 소비
+
+        if _side_job and bg_train is None:
             bg_train = {
-                "pid": bg_pid,
-                "log_path": log_m.group(1).strip(),
-                "proc": bg_proc,
+                "pid": _side_job["pid"],
+                "log_path": _side_job["log_path"],
+                "proc": _side_job.get("proc"),
                 "started_at": time.time(),
                 "last_poll_at": time.time(),
                 "poll_count": 0,
             }
-            worker_buf.append(f"[cyan]📊 학습 모니터 시작: PID {bg_pid}[/cyan]")
+            worker_buf.append(f"[cyan]📊 학습 모니터 시작: PID {_side_job['pid']}[/cyan]")
             refresh("worker", iteration)
+        else:
+            # 2순위: 워커 텍스트에서 PID/LOG 직접 파싱 (폴백)
+            pid_m = _BG_PID_RE.search(last_msg_str)
+            log_m = _BG_LOG_RE.search(last_msg_str)
+            if pid_m and log_m and bg_train is None:
+                bg_pid = int(pid_m.group(1))
+                with _active_procs_lock:
+                    bg_proc = next((p for p in _active_procs if p.pid == bg_pid), None)
+                bg_train = {
+                    "pid": bg_pid,
+                    "log_path": log_m.group(1).strip(),
+                    "proc": bg_proc,
+                    "started_at": time.time(),
+                    "last_poll_at": time.time(),
+                    "poll_count": 0,
+                }
+                worker_buf.append(f"[cyan]📊 학습 모니터 시작: PID {bg_pid}[/cyan]")
+                refresh("worker", iteration)
 
         # ── 학습 모니터링 루프 ────────────────────────────────────────────
         if bg_train is not None:
