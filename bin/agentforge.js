@@ -32,7 +32,7 @@ const DEPS = [
   { import: 'requests',          pip: 'requests'          },
   { import: 'rank_bm25',         pip: 'rank-bm25'         },
   { import: 'tiktoken',          pip: 'tiktoken'          },
-  { import: 'duckduckgo_search', pip: 'duckduckgo-search' },
+  { import: 'ddgs',              pip: 'ddgs'              },
 ];
 
 // ── 인증 확인 ─────────────────────────────────────────

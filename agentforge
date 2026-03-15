@@ -843,17 +843,15 @@ _VISION_TOOLS = [
     {
         "type": "function", "name": "view_image",
         "description": (
-            "Analyze an image file or URL using a vision model. "
-            "Returns a detailed text description of the image content, "
-            "including any text, charts, diagrams, or visual elements. "
-            "Use this when you need to understand what's in an image."
+            "Analyze an image file or URL. Returns a detailed text description "
+            "including any text, charts, diagrams, or visual elements."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Local file path to the image"},
-                "url":  {"type": "string", "description": "URL of the image"},
-                "prompt": {"type": "string", "description": "Optional: specific question or instruction about the image"},
+                "path":   {"type": "string", "description": "Local file path to the image"},
+                "url":    {"type": "string", "description": "URL of the image"},
+                "prompt": {"type": "string", "description": "Optional: specific question about the image"},
             },
         },
         "strict": False,
@@ -1155,9 +1153,12 @@ def _execute_tool(name: str, args: dict, workdir: str, worker_id: int = 0) -> st
                     for i, it in enumerate(items[:8])
                 ) or "(결과 없음)"
             else:
-                # 1순위: duckduckgo-search 패키지 (안정적)
+                # 1순위: ddgs 패키지 (duckduckgo-search 후속, 안정적)
                 try:
-                    from duckduckgo_search import DDGS
+                    try:
+                        from ddgs import DDGS
+                    except ImportError:
+                        from duckduckgo_search import DDGS  # 구버전 호환
                     with DDGS() as ddgs:
                         results = list(ddgs.text(query, max_results=8))
                     if results:
@@ -1200,28 +1201,27 @@ def _execute_tool(name: str, args: dict, workdir: str, worker_id: int = 0) -> st
         elif name == "view_image":
             import base64 as _b64
             path_or_url = args.get("path") or args.get("url", "")
+            if not path_or_url:
+                return "Error: path 또는 url 인자가 필요합니다."
             user_prompt = args.get("prompt", "이 이미지를 자세히 분석해주세요. 텍스트가 있으면 그대로 옮기고, 차트/그래프라면 수치도 설명해주세요.")
 
-            # 이미지 콘텐츠 구성
             if path_or_url.startswith(("http://", "https://")):
-                img_part = {"type": "input_image", "image_url": path_or_url}
+                img_content = {"type": "input_image", "image_url": path_or_url}
             else:
                 ext = Path(path_or_url).suffix.lower().lstrip('.')
                 mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
                         "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp"}.get(ext, "image/jpeg")
                 with open(path_or_url, "rb") as _f:
                     b64data = _b64.b64encode(_f.read()).decode()
-                img_part = {"type": "input_image",
-                            "image_url": f"data:{mime};base64,{b64data}"}
+                img_content = {"type": "input_image",
+                               "image_url": f"data:{mime};base64,{b64data}"}
 
-            # vision 모델로 별도 호출 (스트리밍)
-            _vision_model = "gpt-4o-mini"
+            # 모델 지정 없이 Codex 백엔드 기본 모델 사용 (vision 지원)
             _vision_payload = {
-                "model": _vision_model,
                 "instructions": "You are a vision assistant. Analyze images thoroughly and respond in the same language as the user's prompt.",
                 "input": [{"role": "user", "content": [
                     {"type": "input_text", "text": user_prompt},
-                    img_part,
+                    img_content,
                 ]}],
                 "store": False,
                 "stream": True,
@@ -3221,10 +3221,13 @@ def _osc8_linkify(text: str) -> str:
         return text  # SSH 환경: OSC 8 이스케이프 사용 안 함 (터미널 손상 방지)
     def replace(m):
         path = m.group(0)
-        p = Path(path).expanduser()
-        if p.exists():
-            uri = f"file://{p.resolve()}"
-            return f"\x1b]8;;{uri}\x1b\\{path}\x1b]8;;\x1b\\"
+        try:
+            p = Path(path).expanduser()
+            if p.exists():
+                uri = f"file://{p.resolve()}"
+                return f"\x1b]8;;{uri}\x1b\\{path}\x1b]8;;\x1b\\"
+        except OSError:
+            pass
         return path
     return _PATH_RE.sub(replace, text)
 
