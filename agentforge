@@ -427,9 +427,136 @@ class _ShellLiveProxy:
 
 console = Console()
 _raw_console = console  # TuiAwareConsole로 덮기 전 원본 참조
-_IS_SSH = bool(os.getenv('SSH_CLIENT') or os.getenv('SSH_TTY') or os.getenv('SSH_CONNECTION'))
+def _detect_remote() -> bool:
+    """SSH 또는 tmux(서버) 환경 여부 감지."""
+    if any(os.getenv(v) for v in ('SSH_CLIENT', 'SSH_TTY', 'SSH_CONNECTION')):
+        return True
+    # tmux 안에서 실행 중이면서 DISPLAY/WAYLAND_DISPLAY가 없으면 원격 서버로 판정
+    if os.getenv('TMUX') and not os.getenv('DISPLAY') and not os.getenv('WAYLAND_DISPLAY'):
+        return True
+    return False
+_IS_SSH = _detect_remote()
+
+# ── 자동 업데이트 ──────────────────────────────────────────────────────────────
+_AGENTFORGE_REPO   = "leehogwang/AgentForge"
+_AGENTFORGE_BRANCH = "main"
+
+def _find_source_repo() -> "Path | None":
+    """agentforge 소스 git 저장소 경로 탐색."""
+    # 1. 현재 스크립트와 같은 디렉토리에 .git이 있으면 그 디렉토리
+    script_dir = Path(__file__).resolve().parent
+    if (script_dir / ".git").exists():
+        return script_dir
+    # 2. ~/AgentForge
+    default = Path.home() / "AgentForge"
+    if (default / ".git").exists():
+        return default
+    return None
+
+def _check_and_update() -> None:
+    """시작 시 GitHub에서 업데이트 확인 후 사용자에게 선택지 제공."""
+    src_dir = _find_source_repo()
+    if src_dir is None:
+        return
+
+    # 현재 commit SHA
+    try:
+        current_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=src_dir, stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        return
+
+    # GitHub API로 최신 commit 확인 (3초 타임아웃)
+    try:
+        resp = _requests.get(
+            f"https://api.github.com/repos/{_AGENTFORGE_REPO}/commits/{_AGENTFORGE_BRANCH}",
+            headers={"User-Agent": "agentforge-updater"},
+            timeout=3,
+        )
+        latest_sha = resp.json()["sha"]
+    except Exception:
+        return  # 네트워크 오류 → 조용히 스킵
+
+    if current_sha == latest_sha:
+        return  # 이미 최신
+
+    # 업데이트 프롬프트
+    console.print()
+    console.print(
+        f"[bold cyan]✨ AgentForge 업데이트 가능[/bold cyan]  "
+        f"[dim]{current_sha[:8]}[/dim] → [green]{latest_sha[:8]}[/green]"
+    )
+    console.print("  [bold]U[/bold] 지금 업데이트   [bold]S[/bold] 건너뛰기\n")
+    try:
+        import sys as _sys
+        choice = input("선택 [u/S]: ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        console.print()
+        return
+
+    if choice != "u":
+        console.print("[dim]업데이트 건너뜁니다.[/dim]\n")
+        return
+
+    # git pull
+    console.print("[dim]⬇  최신 코드 받는 중...[/dim]")
+    try:
+        result = subprocess.run(
+            ["git", "pull", "--ff-only"], cwd=src_dir,
+            capture_output=True, text=True, check=True
+        )
+        console.print(f"[dim]{result.stdout.strip()}[/dim]")
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]git pull 실패:[/red] {e.stderr.strip()}")
+        return
+
+    # .local/bin/agentforge 재배포
+    import shutil as _shutil_up
+    deploy_target = Path.home() / ".local" / "bin" / "agentforge"
+    src_script = src_dir / "agentforge"
+    if src_script.exists() and deploy_target.exists():
+        _shutil_up.copy2(src_script, deploy_target)
+
+    console.print("[green]✓ 업데이트 완료! 새 버전으로 재시작합니다...[/green]\n")
+    time.sleep(0.5)
+    # 현재 프로세스를 새 버전으로 교체 (업데이트 체크 스킵 플래그 추가)
+    new_argv = [sys.argv[0]] + ["--skip-update-check"] + sys.argv[1:]
+    os.execv(sys.argv[0], new_argv)
+
 _last_session: dict | None = None        # {goal, history, eval_history, workdir}
 _interrupt_event = threading.Event()     # ESC 감지 플래그
+
+# ── bg_train 세션 간 영속화 ────────────────────────────────────────────────────
+_BG_TRAIN_STATE_FILE = Path.home() / ".agentforge" / "bg_train_state.json"
+
+def _save_bg_train_state(bg: "dict | None") -> None:
+    """bg_train 상태를 파일에 저장 (proc 제외 — 직렬화 불가)."""
+    try:
+        if bg is None:
+            _BG_TRAIN_STATE_FILE.unlink(missing_ok=True)
+            return
+        state = {k: v for k, v in bg.items() if k != "proc"}
+        _BG_TRAIN_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _BG_TRAIN_STATE_FILE.write_text(json.dumps(state))
+    except Exception:
+        pass
+
+def _load_bg_train_state() -> "dict | None":
+    """저장된 bg_train 상태 복원. 프로세스가 살아있을 때만 반환."""
+    try:
+        if not _BG_TRAIN_STATE_FILE.exists():
+            return None
+        state = json.loads(_BG_TRAIN_STATE_FILE.read_text())
+        pid = state.get("pid")
+        if pid and _is_proc_alive(pid, None):
+            state["proc"] = None
+            return state
+        # 프로세스 종료됨 → 상태 파일 삭제
+        _BG_TRAIN_STATE_FILE.unlink(missing_ok=True)
+        return None
+    except Exception:
+        return None
 _active_procs: set = set()               # 실행 중인 서브프로세스 추적
 _active_procs_lock = threading.Lock()
 
@@ -654,7 +781,7 @@ WORKER_TOOLS = [
 ]
 
 
-RESEARCH_TOOLS = WORKER_TOOLS + [
+_WEB_TOOLS = [
     {
         "type": "function", "name": "web_search",
         "description": "Search the web using DuckDuckGo (or Brave if BRAVE_API_KEY set). Returns summaries and links.",
@@ -672,6 +799,9 @@ RESEARCH_TOOLS = WORKER_TOOLS + [
         "strict": False,
     },
 ]
+
+WORKER_TOOLS = WORKER_TOOLS + _WEB_TOOLS
+RESEARCH_TOOLS = WORKER_TOOLS
 
 
 def _iter_events(payload: dict):
@@ -1577,6 +1707,16 @@ WORKER_SYSTEM = textwrap.dedent("""\
     - After launching with shell_background, briefly summarize what was launched and why,
       then end your turn. Do NOT wait or poll — the monitor will take over.
     - Using shell for training bypasses all monitoring and wastes GPU time on bad runs.
+
+    TRAINING LOG FORMAT RULE (strictly enforced in all training scripts you write):
+    - NEVER print inside data loading, preprocessing, KNN building, or per-sample loops.
+      These generate thousands of useless lines and hide real metrics.
+    - Log metrics at epoch level ONLY, in this exact format (one line per epoch):
+        Epoch {N}/{total} | loss={x:.4f} | PMAE={y:.2f}% | val_loss={z:.4f}
+    - Also log: training start, data loading complete, first batch start, final result.
+    - Use print(..., flush=True) so logs appear in real-time.
+    - If using tqdm, use tqdm(disable=not sys.stdout.isatty()) or redirect to stderr.
+    - Violating this rule makes the monitor blind — it cannot judge progress or stop bad runs.
 """).strip()
 
 EVALUATOR_SYSTEM = textwrap.dedent("""\
@@ -3472,6 +3612,16 @@ def _cleanup_bg(bg: dict) -> None:
             pass
 
 
+def _parse_monitor_decision(text: str) -> tuple[str, str]:
+    """CONTINUE/DONE/KILL 파싱 — 대시·공백 구분자도 허용."""
+    first_line = text.strip().split('\n')[0].strip()
+    for kw in ('DONE', 'KILL', 'CONTINUE'):
+        if first_line.upper().startswith(kw):
+            rest = first_line[len(kw):].lstrip(' :—–-').strip()
+            return kw, rest
+    return parse_decision(text)
+
+
 def _run_monitor_loop(bg: dict, goal: str, workdir: str, eval_model: str | None,
                       poll_sec: int, layout, live, worker_buf: deque,
                       eval_history: list, iteration: int, refresh) -> str:
@@ -3512,7 +3662,7 @@ def _run_monitor_loop(bg: dict, goal: str, workdir: str, eval_model: str | None,
         refresh("evaluator", iteration)
         eval_msg, _ = run_evaluator(monitor_prompt, workdir, eval_model,
                                     system_prompt=MONITOR_EVALUATOR_SYSTEM)
-        decision, feedback = parse_decision(eval_msg)
+        decision, feedback = _parse_monitor_decision(eval_msg)
         decision = decision.upper()
 
         eval_history.append({
@@ -3570,6 +3720,14 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
     worker_status = ["idle"]
     done = False
     bg_train: dict | None = None   # 백그라운드 학습 job 추적
+    # 이전 세션에서 실행 중인 학습 프로세스 복원
+    _resumed_bg = _load_bg_train_state()
+    if _resumed_bg:
+        bg_train = _resumed_bg
+        worker_buf.append(
+            f"[cyan]📊 이전 세션 학습 재모니터링: PID {bg_train['pid']} "
+            f"로그: {bg_train['log_path']}[/cyan]"
+        )
     ab_cooldown = 0                # A/B 직후 N회는 정체 감지 억제
     _session_start = time.time()   # 세션 시작 시각
 
@@ -3718,6 +3876,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                 "last_poll_at": time.time(),
                 "poll_count": 0,
             }
+            _save_bg_train_state(bg_train)
             worker_buf.append(f"[cyan]📊 학습 모니터 시작: PID {_side_job['pid']}[/cyan]")
             refresh("worker", iteration)
         else:
@@ -3736,6 +3895,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                     "last_poll_at": time.time(),
                     "poll_count": 0,
                 }
+                _save_bg_train_state(bg_train)
                 worker_buf.append(f"[cyan]📊 학습 모니터 시작: PID {bg_pid}[/cyan]")
                 refresh("worker", iteration)
 
@@ -3769,9 +3929,11 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                     'full_msg': f"KILL:{kill_reason}",
                 })
                 bg_train = None
+                _save_bg_train_state(None)
                 continue  # 다음 iteration → Worker가 REDIRECT 보고 새 전략 시도
             elif monitor_result == "interrupted":
                 bg_train = None
+                _save_bg_train_state(None)
                 live.stop()
                 _last_session = {
                     "goal": goal, "history": history,
@@ -3782,6 +3944,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
             else:  # "natural_exit"
                 bg_train_log = bg_train.get("log_path", "")
                 bg_train = None
+                _save_bg_train_state(None)
                 # 학습 완료 → evaluator context에 로그 tail + 안내 주입
                 if bg_train_log:
                     _completed_log_tail = _read_log_tail(bg_train_log, lines=50)
@@ -3885,6 +4048,17 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
             console.print()
             console.print(Rule(f"[bold green]✓ 완료 — {iteration}번 반복[/bold green]"))
             console.print()
+
+            # Q&A / 조회 작업: 결과물 위치가 없으면 worker 답변을 직접 출력
+            _loc_m = re.search(r'결과물 위치:\s*(.+?)(?=\n판단|결과물|결과 요약|\Z)', eval_msg, re.S)
+            _loc_val = _loc_m.group(1).strip() if _loc_m else ""
+            _no_file = (not _loc_val or _loc_val.lower() in ('해당 없음', 'n/a', 'none', '-', '없음'))
+            if _no_file and last_msg and last_msg.strip():
+                console.print("[bold]답변[/bold]")
+                for _line in last_msg.strip().splitlines():
+                    console.print(f"  [bright_white]{_line}[/bright_white]")
+                console.print()
+
             for section, color in [('판단 이유', 'white'), ('결과물 위치', 'cyan'), ('결과 요약', 'bright_white')]:
                 m = re.search(rf'{section}:\s*(.+?)(?=\n판단|결과물|결과 요약|\Z)', eval_msg, re.S)
                 if m:
@@ -4762,6 +4936,10 @@ def _interactive_controller(args, workdir: str, max_iter: int, ui: InteractiveSh
 def main():
     argv = sys.argv[1:]
 
+    # --skip-update-check: 업데이트 후 재시작 시 루프 방지
+    _skip_update = "--skip-update-check" in argv
+    argv = [a for a in argv if a != "--skip-update-check"]
+
     if argv and argv[0] in ("-r", "--reconnect"):
         _tmux_reconnect(_resolve_cli_workdir(argv[1:]))
         return
@@ -4841,6 +5019,10 @@ def main():
         if force_new and _tmux_session_exists(session_name):
             subprocess.run(["tmux", "kill-session", "-t", session_name])
         _tmux_launch(cli_args, session_name)
+
+    # 업데이트 체크 (tmux 안에서 실행, 재시작 후에는 스킵)
+    if not _skip_update:
+        _check_and_update()
 
     _set_session_context(workdir)
 
