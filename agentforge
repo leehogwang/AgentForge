@@ -1560,6 +1560,15 @@ WORKER_SYSTEM = textwrap.dedent("""\
     If the task involves training ML models or data analysis:
     - WANDB_API_KEY is pre-configured; call wandb.init() freely (WANDB_PROJECT = workdir name)
     - Use the data_profile tool on any dataset before modeling to get feature engineering suggestions
+
+    LONG-RUNNING TASK RULE (strictly enforced):
+    - For ANY training/fine-tuning/long computation (expected > 1 minute), you MUST use
+      shell_background — NEVER use shell for training jobs.
+    - shell_background returns PID and LOG path, which enables the monitor to watch progress
+      and kill the job early if it's not converging toward the goal.
+    - After launching with shell_background, briefly summarize what was launched and why,
+      then end your turn. Do NOT wait or poll — the monitor will take over.
+    - Using shell for training bypasses all monitoring and wastes GPU time on bad runs.
 """).strip()
 
 EVALUATOR_SYSTEM = textwrap.dedent("""\
