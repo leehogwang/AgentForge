@@ -27,11 +27,12 @@ const BOLD   = '\x1b[1m';
 const DIM    = '\x1b[2m';
 
 const DEPS = [
-  { import: 'rich',           pip: 'rich'           },
-  { import: 'prompt_toolkit', pip: 'prompt_toolkit' },
-  { import: 'requests',       pip: 'requests'       },
-  { import: 'rank_bm25',      pip: 'rank-bm25'      },
-  { import: 'tiktoken',       pip: 'tiktoken'       },
+  { import: 'rich',              pip: 'rich'              },
+  { import: 'prompt_toolkit',    pip: 'prompt_toolkit'    },
+  { import: 'requests',          pip: 'requests'          },
+  { import: 'rank_bm25',         pip: 'rank-bm25'         },
+  { import: 'tiktoken',          pip: 'tiktoken'          },
+  { import: 'duckduckgo_search', pip: 'duckduckgo-search' },
 ];
 
 // ── 인증 확인 ─────────────────────────────────────────

@@ -582,6 +582,7 @@ def _check_and_update() -> None:
     os.execv(sys.argv[0], new_argv)
 
 _last_session: dict | None = None        # {goal, history, eval_history, workdir}
+_last_qa_answer: "str | None" = None    # 마지막 Q&A 답변 (없음 위치 + 텍스트 응답)
 _interrupt_event = threading.Event()     # ESC 감지 플래그
 
 # ── bg_train 세션 간 영속화 ────────────────────────────────────────────────────
@@ -857,7 +858,10 @@ _WEB_TOOLS = [
     },
 ]
 
-WORKER_TOOLS = WORKER_TOOLS + _WEB_TOOLS
+# Codex 내장 web_search (API가 직접 실행 — 우선 사용)
+_CODEX_BUILTIN_SEARCH = {"type": "web_search_preview"}
+
+WORKER_TOOLS = WORKER_TOOLS + [_CODEX_BUILTIN_SEARCH] + _WEB_TOOLS
 RESEARCH_TOOLS = WORKER_TOOLS
 
 
@@ -1132,24 +1136,42 @@ def _execute_tool(name: str, args: dict, workdir: str, worker_id: int = 0) -> st
                     for i, it in enumerate(items[:8])
                 ) or "(결과 없음)"
             else:
-                r = _session.get(
-                    "https://html.duckduckgo.com/html/",
-                    params={"q": query},
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=15,
-                )
-                snippets = re.findall(r'class="result__snippet">(.*?)</a>', r.text, re.S)
-                titles   = re.findall(r'class="result__a"[^>]*>(.*?)</a>', r.text, re.S)
-                urls     = re.findall(r'uddg=(https?[^&"]+)', r.text)
-                from urllib.parse import unquote
-                lines = []
-                for i, (t, u, s) in enumerate(zip(titles, urls, snippets)):
-                    t = re.sub(r'<[^>]+>', '', t).strip()
-                    s = re.sub(r'<[^>]+>', '', s).strip()
-                    lines.append(f"[{i+1}] {t}\n    {unquote(u)}\n    {s}")
-                    if i >= 7:
-                        break
-                return "\n".join(lines) or "(결과 없음)"
+                # 1순위: duckduckgo-search 패키지 (안정적)
+                try:
+                    from duckduckgo_search import DDGS
+                    with DDGS() as ddgs:
+                        results = list(ddgs.text(query, max_results=8))
+                    if results:
+                        return "\n".join(
+                            f"[{i+1}] {r.get('title','')}\n    {r.get('href','')}\n    {r.get('body','')}"
+                            for i, r in enumerate(results)
+                        )
+                except Exception:
+                    pass
+                # 2순위: DuckDuckGo HTML 스크래핑 (폴백)
+                try:
+                    from urllib.parse import unquote
+                    r = _session.get(
+                        "https://html.duckduckgo.com/html/",
+                        params={"q": query},
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                        timeout=15,
+                    )
+                    snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</(?:a|span)>', r.text, re.S)
+                    titles   = re.findall(r'class="result__a"[^>]*>(.*?)</a>', r.text, re.S)
+                    urls     = re.findall(r'uddg=(https?[^&"]+)', r.text)
+                    lines = []
+                    for i, (t, u, s) in enumerate(zip(titles, urls, snippets)):
+                        t = re.sub(r'<[^>]+>', '', t).strip()
+                        s = re.sub(r'<[^>]+>', '', s).strip()
+                        lines.append(f"[{i+1}] {t}\n    {unquote(u)}\n    {s}")
+                        if i >= 7:
+                            break
+                    if lines:
+                        return "\n".join(lines)
+                except Exception:
+                    pass
+                return "(결과 없음)"
         elif name == "fetch_url":
             url = args["url"]
             r = _session.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -1182,6 +1204,7 @@ SLASH_COMMANDS = [
     ("/status",          "현재 설정 확인"),
     ("/wandb",           "wandb 연동 상태 확인"),
     ("/report",          "현재 목표의 실험 리포트 출력"),
+    ("/last",            "마지막 Q&A 답변 다시 보기"),
     ("/paper <url>",     "arXiv/논문 URL → 코드 자동 구현 목표 설정"),
     ("/mcp list",          "연결된 MCP 서버 및 툴 목록"),
     ("/mcp install <pkg>", "MCP 서버 설치 및 등록 (예: @playwright/mcp)"),
@@ -2849,6 +2872,7 @@ def run_worker(prompt: str, workdir: str, model: str | None,
     model = model or DEFAULT_WORKER_MODEL
     system_prompt = system_prompt or WORKER_SYSTEM
     tools = tools if tools is not None else WORKER_TOOLS
+    _use_builtin_search = any(t.get("type") == "web_search_preview" for t in tools)
     status_ref[0] = "running"
 
     # 입력 히스토리 (user msg + function_call + function_call_output 누적)
@@ -2882,29 +2906,57 @@ def run_worker(prompt: str, workdir: str, model: str | None,
         fc_items: list[dict] = []   # {call_id, name, arguments}
         got_error = False
 
+        _builtin_search_error = False
         for ev in _iter_events(payload):
             evtype = ev["type"]
             if evtype == "_error":
-                buf.append(f"[red]API 오류: {ev['message']}[/red]")
-                status_ref[0] = "error"
-                if line_buf.strip():
-                    buf.append(colorize_line(line_buf))
-                got_error = True
+                msg = ev.get("message", "")
+                # built-in web_search_preview 미지원 오류 → 재시도
+                if _use_builtin_search and ("web_search" in msg.lower() or "unknown" in msg.lower() or "invalid" in msg.lower()):
+                    _builtin_search_error = True
+                    got_error = False  # 오류 아님 — 재시도할 것
+                else:
+                    buf.append(f"[red]API 오류: {msg}[/red]")
+                    status_ref[0] = "error"
+                    if line_buf.strip():
+                        buf.append(colorize_line(line_buf))
+                    got_error = True
                 break
             elif evtype == "response.output_text.delta":
                 delta = ev.get("delta", "")
                 text_parts.append(delta)
                 _flush_line(delta)
-            elif evtype == "response.output_item.done" and ev.get("item", {}).get("type") == "function_call":
-                item = ev["item"]
-                fc_items.append({
-                    "call_id": item["call_id"],
-                    "name":    item["name"],
-                    "arguments": item["arguments"],
-                })
+            elif evtype == "response.output_item.done":
+                item = ev.get("item", {})
+                item_type = item.get("type", "")
+                if item_type == "function_call":
+                    fc_items.append({
+                        "call_id": item["call_id"],
+                        "name":    item["name"],
+                        "arguments": item["arguments"],
+                    })
+                elif item_type == "web_search_call":
+                    # 내장 web_search_preview — API가 직접 실행, 쿼리만 표시
+                    query = item.get("action", {}).get("query", "") if isinstance(item.get("action"), dict) else ""
+                    if not query:
+                        # 다른 구조 시도
+                        for act in (item.get("actions") or []):
+                            if isinstance(act, dict) and act.get("query"):
+                                query = act["query"]
+                                break
+                    buf.append(f"[dim]🔍 검색: {query or '(web search)'}[/dim]")
 
         if got_error:
             return "\n".join(all_text_parts), 1
+
+        # built-in web_search_preview 미지원 → 해당 툴 제거 후 이번 round 재시도
+        if _builtin_search_error:
+            buf.append("[dim]내장 web_search 미지원 — 커스텀 web_search로 전환[/dim]")
+            tools = [t for t in tools if t.get("type") != "web_search_preview"]
+            _use_builtin_search = False
+            text_parts = []
+            fc_items = []
+            continue  # 같은 round 재시도
 
         round_text = "".join(text_parts)
         if round_text:
@@ -4113,9 +4165,15 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                         _loc_val.lower().startswith(('없음', '해당 없음', 'n/a', 'none', '-')) or
                         not any(c in _loc_val for c in ('/', '\\', '.')))
             if _no_file and last_msg and last_msg.strip():
-                console.print("[bold]답변[/bold]")
-                for _line in last_msg.strip().splitlines():
-                    console.print(f"  [bright_white]{_line}[/bright_white]")
+                global _last_qa_answer
+                _last_qa_answer = last_msg.strip()
+                console.print(Panel(
+                    last_msg.strip(),
+                    title="[bold cyan]답변[/bold cyan]",
+                    border_style="cyan",
+                    padding=(0, 1),
+                ))
+                console.print("[dim]  /last 로 언제든 다시 볼 수 있습니다[/dim]")
                 console.print()
 
             for section, color in [('판단 이유', 'white'), ('결과물 위치', 'cyan'), ('결과 요약', 'bright_white')]:
@@ -4884,6 +4942,18 @@ def _interactive_controller(args, workdir: str, max_iter: int, ui: InteractiveSh
 
                 if cmd_name == "wandb":
                     _wandb_status()
+                    continue
+
+                if cmd_name == "last":
+                    if _last_qa_answer:
+                        console.print(Panel(
+                            _last_qa_answer,
+                            title="[bold cyan]마지막 답변[/bold cyan]",
+                            border_style="cyan",
+                            padding=(0, 1),
+                        ))
+                    else:
+                        console.print("[dim]아직 Q&A 답변이 없습니다.[/dim]")
                     continue
 
                 if cmd_name == "report":
