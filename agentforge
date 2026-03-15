@@ -1609,6 +1609,19 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
 
     After IMPROVE or REDIRECT, write the feedback in Korean if possible.
     Do NOT write anything before the decision keyword.
+
+    LONG-RUNNING TASK RULE:
+    - If worker output shows a background training/task was STARTED (PID mentioned,
+      "training started", "학습 시작", "백그라운드에서 시작" etc.) but NO evaluation
+      results (PMAE %, accuracy numbers, loss values from evaluate.py) are shown yet:
+      → Give IMPROVE: "학습이 완료됐지만 평가가 실행되지 않았습니다. evaluate.py를 실행해 PMAE 수치를 측정하고 보고하세요."
+      → Do NOT give REDIRECT just because numeric metrics aren't shown yet.
+      → Do NOT give DONE unless actual evaluation results confirm the goal is met.
+    - If the [BACKGROUND TRAINING COMPLETED] section appears in the worker output:
+      → Training has already finished. Evaluate whether the worker ran evaluate.py afterwards.
+      → If evaluation was NOT run: IMPROVE with instruction to run it.
+      → If evaluation WAS run and metrics meet the goal: DONE.
+      → If evaluation WAS run and metrics don't meet the goal: IMPROVE or REDIRECT as appropriate.
 """).strip()
 
 RESEARCH_WORKER_SYSTEM = textwrap.dedent("""\
@@ -2039,14 +2052,32 @@ AB_COMPARE_SYSTEM = textwrap.dedent("""\
 """).strip()
 
 MONITOR_EVALUATOR_SYSTEM = textwrap.dedent("""\
-    You are a training monitor. Read the training log tail and decide:
+    You are a training monitor. Analyze the training log and metric trends to decide whether to continue, declare done, or kill the job early.
 
-      CONTINUE   — loss is decreasing, training is progressing normally
-      DONE       — training finished (final checkpoint saved / "Training complete" seen)
-      KILL: <reason> — loss is NaN/exploding, an error occurred, no progress, or wrong direction
+    Response format — first line must be exactly one of:
+      CONTINUE      — metric is improving, training should proceed
+      DONE          — training completed AND final checkpoint saved
+      KILL: <reason> — stop training early (see conditions below)
 
-    First line MUST be exactly one of: CONTINUE, DONE, or KILL: <reason>
-    Then write 1-3 sentences of explanation.
+    KILL conditions (any one is sufficient):
+      - NaN or exploding loss/gradients
+      - Fatal error or crash in log
+      - Metric has NOT improved for 10+ consecutive epochs/steps
+      - Extrapolated trend shows the TARGET METRIC is UNREACHABLE before training ends
+        (e.g., goal is PMAE ≤ 15%, current PMAE is 35% after 60%+ of epochs with flat/slow trend)
+      - Loss is consistently increasing (wrong direction)
+
+    CONTINUE conditions:
+      - Metric is steadily improving toward the goal
+      - Some plateau but still within first 30% of training
+      - Recent improvement visible in last logged epochs
+
+    DONE conditions:
+      - Log contains "Training complete", "Finished training", or equivalent AND best checkpoint saved
+      - Process exited cleanly with final metrics logged
+
+    Pay special attention to the METRIC TREND SUMMARY provided — use it to judge convergence trajectory.
+    Always include 1-2 sentences of reasoning after the decision keyword.
     Do NOT write anything before the decision keyword.
 """).strip()
 
@@ -3367,11 +3398,39 @@ def _is_proc_alive(pid: int, proc) -> bool:
         return False
 
 
+def _extract_metric_trend(log_tail: str) -> str:
+    """로그에서 PMAE/loss/accuracy 숫자를 추출해 트렌드 요약을 반환."""
+    import re as _re
+    patterns = [
+        (_re.compile(r'(?i)pmae[=:\s]+(\d+\.?\d*)\s*%?'), 'PMAE'),
+        (_re.compile(r'(?i)val(?:_loss)?[=:\s]+(\d+\.?\d*)'), 'val_loss'),
+        (_re.compile(r'(?i)(?<!\w)loss[=:\s]+(\d+\.?\d*)'), 'loss'),
+        (_re.compile(r'(?i)acc(?:uracy)?[=:\s]+(\d+\.?\d*)\s*%?'), 'acc'),
+        (_re.compile(r'(?i)mae[=:\s]+(\d+\.?\d*)'), 'MAE'),
+    ]
+    results = []
+    for pat, name in patterns:
+        vals = [float(m.group(1)) for m in pat.finditer(log_tail)]
+        if len(vals) >= 2:
+            trend = vals[-1] - vals[0]
+            direction = "↓" if trend < 0 else "↑"
+            results.append(
+                f"  {name}: {vals[0]:.3f} → {vals[-1]:.3f} "
+                f"({direction}{abs(trend):.3f} over {len(vals)} data points, "
+                f"latest={vals[-1]:.3f})"
+            )
+    return "\n".join(results) if results else "  (no numeric metrics detected in log)"
+
+
 def _build_monitor_prompt(goal: str, log_tail: str, pid: int,
                            elapsed: float, poll_count: int) -> str:
+    trend_summary = _extract_metric_trend(log_tail)
     return "\n".join([
         f"TRAINING GOAL: {goal}",
         f"PID: {pid}  |  Elapsed: {int(elapsed // 60)}m {int(elapsed % 60)}s  |  Poll #{poll_count}",
+        "",
+        "METRIC TREND SUMMARY (auto-extracted from log):",
+        trend_summary,
         "",
         "TRAINING LOG (last 200 lines):",
         "─" * 60,
@@ -3685,8 +3744,20 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                 _persist_session(_last_session)
                 return _finish('interrupted')
             else:  # "natural_exit"
+                bg_train_log = bg_train.get("log_path", "")
                 bg_train = None
-                # 프로세스가 자연 종료 → 결과 평가로 계속 진행
+                # 학습 완료 → evaluator context에 로그 tail + 안내 주입
+                if bg_train_log:
+                    _completed_log_tail = _read_log_tail(bg_train_log, lines=50)
+                    last_msg = (
+                        (last_msg or "")
+                        + "\n\n[BACKGROUND TRAINING COMPLETED]\n"
+                        + f"Final training log (last 50 lines):\n{_completed_log_tail}\n\n"
+                        + "NOTE: Background training has finished. "
+                        + "The worker must now run evaluation (evaluate.py or equivalent) "
+                        + "and report actual PMAE/metric numbers before this iteration "
+                        + "can be considered complete."
+                    )
 
         # ── Evaluator ────────────────────────────────────────────────────
         if _interrupt_event.is_set():
