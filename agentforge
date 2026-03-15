@@ -4109,7 +4109,9 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
             # Q&A / 조회 작업: 결과물 위치가 없으면 worker 답변을 직접 출력
             _loc_m = re.search(r'결과물 위치:\s*(.+?)(?=\n판단|결과물|결과 요약|\Z)', eval_msg, re.S)
             _loc_val = _loc_m.group(1).strip() if _loc_m else ""
-            _no_file = (not _loc_val or _loc_val.lower() in ('해당 없음', 'n/a', 'none', '-', '없음'))
+            _no_file = (not _loc_val or
+                        _loc_val.lower().startswith(('없음', '해당 없음', 'n/a', 'none', '-')) or
+                        not any(c in _loc_val for c in ('/', '\\', '.')))
             if _no_file and last_msg and last_msg.strip():
                 console.print("[bold]답변[/bold]")
                 for _line in last_msg.strip().splitlines():
