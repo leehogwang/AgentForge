@@ -438,8 +438,9 @@ def _detect_remote() -> bool:
 _IS_SSH = _detect_remote()
 
 # ── 자동 업데이트 ──────────────────────────────────────────────────────────────
-_AGENTFORGE_REPO   = "leehogwang/AgentForge"
-_AGENTFORGE_BRANCH = "main"
+_AGENTFORGE_REPO        = "leehogwang/AgentForge"
+_AGENTFORGE_BRANCH      = "main"
+_AGENTFORGE_NPM_PACKAGE = "agentforge-multi"
 
 def _find_source_repo() -> "Path | None":
     """agentforge 소스 git 저장소 경로 탐색."""
@@ -453,43 +454,92 @@ def _find_source_repo() -> "Path | None":
         return default
     return None
 
-def _check_and_update() -> None:
-    """시작 시 GitHub에서 업데이트 확인 후 사용자에게 선택지 제공."""
+def _get_pkg_info() -> "tuple[str, str] | None":
+    """
+    현재 설치 방식에 따라 (현재버전, 설치방식) 반환.
+    - npm 설치: package.json에서 버전 읽기 → ('0.1.32', 'npm')
+    - git 클론: git HEAD SHA → ('abc1234', 'git')
+    """
+    script_dir = Path(__file__).resolve().parent
+
+    # npm 설치: 스크립트 옆에 package.json 존재
+    pkg_json = script_dir / "package.json"
+    if pkg_json.exists():
+        try:
+            data = json.loads(pkg_json.read_text())
+            version = data.get("version", "")
+            if version:
+                return version, "npm"
+        except Exception:
+            pass
+
+    # git 클론: .git 디렉토리 탐색
     src_dir = _find_source_repo()
-    if src_dir is None:
+    if src_dir:
+        try:
+            sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=src_dir, stderr=subprocess.DEVNULL
+            ).decode().strip()
+            return sha, "git"
+        except Exception:
+            pass
+
+    return None
+
+
+def _check_and_update() -> None:
+    """시작 시 업데이트 확인 후 사용자에게 선택지 제공 (npm/git 모두 지원)."""
+    pkg_info = _get_pkg_info()
+    if pkg_info is None:
         return
 
-    # 현재 commit SHA
-    try:
-        current_sha = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=src_dir, stderr=subprocess.DEVNULL
-        ).decode().strip()
-    except Exception:
-        return
+    current_ver, install_type = pkg_info
 
-    # GitHub API로 최신 commit 확인 (3초 타임아웃)
-    try:
-        resp = _requests.get(
-            f"https://api.github.com/repos/{_AGENTFORGE_REPO}/commits/{_AGENTFORGE_BRANCH}",
-            headers={"User-Agent": "agentforge-updater"},
-            timeout=3,
-        )
-        latest_sha = resp.json()["sha"]
-    except Exception:
-        return  # 네트워크 오류 → 조용히 스킵
+    if install_type == "npm":
+        # npm registry에서 최신 버전 확인
+        try:
+            resp = _requests.get(
+                f"https://registry.npmjs.org/{_AGENTFORGE_NPM_PACKAGE}/latest",
+                timeout=3,
+            )
+            latest_ver = resp.json()["version"]
+        except Exception:
+            return
 
-    if current_sha == latest_sha:
-        return  # 이미 최신
+        if current_ver == latest_ver:
+            return  # 이미 최신
+
+        display_cur = f"v{current_ver}"
+        display_new = f"v{latest_ver}"
+        update_cmd  = ["npm", "install", "-g", _AGENTFORGE_NPM_PACKAGE]
+
+    else:  # git
+        # GitHub API로 최신 commit 확인
+        try:
+            resp = _requests.get(
+                f"https://api.github.com/repos/{_AGENTFORGE_REPO}/commits/{_AGENTFORGE_BRANCH}",
+                headers={"User-Agent": "agentforge-updater"},
+                timeout=3,
+            )
+            latest_ver = resp.json()["sha"]
+        except Exception:
+            return
+
+        if current_ver == latest_ver:
+            return  # 이미 최신
+
+        display_cur = current_ver[:8]
+        display_new = latest_ver[:8]
+        update_cmd  = None  # git pull 사용
 
     # 업데이트 프롬프트
     console.print()
     console.print(
         f"[bold cyan]✨ AgentForge 업데이트 가능[/bold cyan]  "
-        f"[dim]{current_sha[:8]}[/dim] → [green]{latest_sha[:8]}[/green]"
+        f"[dim]{display_cur}[/dim] → [green]{display_new}[/green]"
     )
     console.print("  [bold]U[/bold] 지금 업데이트   [bold]S[/bold] 건너뛰기\n")
     try:
-        import sys as _sys
         choice = input("선택 [u/S]: ").strip().lower()
     except (KeyboardInterrupt, EOFError):
         console.print()
@@ -499,28 +549,35 @@ def _check_and_update() -> None:
         console.print("[dim]업데이트 건너뜁니다.[/dim]\n")
         return
 
-    # git pull
     console.print("[dim]⬇  최신 코드 받는 중...[/dim]")
-    try:
-        result = subprocess.run(
-            ["git", "pull", "--ff-only"], cwd=src_dir,
-            capture_output=True, text=True, check=True
-        )
-        console.print(f"[dim]{result.stdout.strip()}[/dim]")
-    except subprocess.CalledProcessError as e:
-        console.print(f"[red]git pull 실패:[/red] {e.stderr.strip()}")
-        return
 
-    # .local/bin/agentforge 재배포
-    import shutil as _shutil_up
-    deploy_target = Path.home() / ".local" / "bin" / "agentforge"
-    src_script = src_dir / "agentforge"
-    if src_script.exists() and deploy_target.exists():
-        _shutil_up.copy2(src_script, deploy_target)
+    if install_type == "npm":
+        # npm install -g agentforge-multi
+        try:
+            subprocess.run(update_cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            console.print(f"[red]npm 업데이트 실패.[/red] 수동으로 실행하세요: {' '.join(update_cmd)}")
+            return
+    else:
+        # git pull + .local/bin 재배포
+        src_dir = _find_source_repo()
+        try:
+            result = subprocess.run(
+                ["git", "pull", "--ff-only"], cwd=src_dir,
+                capture_output=True, text=True, check=True
+            )
+            console.print(f"[dim]{result.stdout.strip()}[/dim]")
+        except subprocess.CalledProcessError as e:
+            console.print(f"[red]git pull 실패:[/red] {e.stderr.strip()}")
+            return
+        import shutil as _shutil_up
+        deploy_target = Path.home() / ".local" / "bin" / "agentforge"
+        src_script = src_dir / "agentforge"
+        if src_script.exists() and deploy_target.exists():
+            _shutil_up.copy2(src_script, deploy_target)
 
     console.print("[green]✓ 업데이트 완료! 새 버전으로 재시작합니다...[/green]\n")
     time.sleep(0.5)
-    # 현재 프로세스를 새 버전으로 교체 (업데이트 체크 스킵 플래그 추가)
     new_argv = [sys.argv[0]] + ["--skip-update-check"] + sys.argv[1:]
     os.execv(sys.argv[0], new_argv)
 
