@@ -839,6 +839,27 @@ WORKER_TOOLS = [
 ]
 
 
+_VISION_TOOLS = [
+    {
+        "type": "function", "name": "view_image",
+        "description": (
+            "Analyze an image file or URL using a vision model. "
+            "Returns a detailed text description of the image content, "
+            "including any text, charts, diagrams, or visual elements. "
+            "Use this when you need to understand what's in an image."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Local file path to the image"},
+                "url":  {"type": "string", "description": "URL of the image"},
+                "prompt": {"type": "string", "description": "Optional: specific question or instruction about the image"},
+            },
+        },
+        "strict": False,
+    },
+]
+
 _WEB_TOOLS = [
     {
         "type": "function", "name": "web_search",
@@ -859,9 +880,7 @@ _WEB_TOOLS = [
 ]
 
 # Codex 내장 web_search (API가 직접 실행 — 우선 사용)
-_CODEX_BUILTIN_SEARCH = {"type": "web_search_preview"}
-
-WORKER_TOOLS = WORKER_TOOLS + [_CODEX_BUILTIN_SEARCH] + _WEB_TOOLS
+WORKER_TOOLS = WORKER_TOOLS + _VISION_TOOLS + _WEB_TOOLS
 RESEARCH_TOOLS = WORKER_TOOLS
 
 
@@ -1178,6 +1197,43 @@ def _execute_tool(name: str, args: dict, workdir: str, worker_id: int = 0) -> st
             text = re.sub(r'<[^>]+>', ' ', r.text)
             text = re.sub(r'\s+', ' ', text).strip()
             return text[:8000]
+        elif name == "view_image":
+            import base64 as _b64
+            path_or_url = args.get("path") or args.get("url", "")
+            user_prompt = args.get("prompt", "이 이미지를 자세히 분석해주세요. 텍스트가 있으면 그대로 옮기고, 차트/그래프라면 수치도 설명해주세요.")
+
+            # 이미지 콘텐츠 구성
+            if path_or_url.startswith(("http://", "https://")):
+                img_part = {"type": "input_image", "image_url": path_or_url}
+            else:
+                ext = Path(path_or_url).suffix.lower().lstrip('.')
+                mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                        "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp"}.get(ext, "image/jpeg")
+                with open(path_or_url, "rb") as _f:
+                    b64data = _b64.b64encode(_f.read()).decode()
+                img_part = {"type": "input_image",
+                            "image_url": f"data:{mime};base64,{b64data}"}
+
+            # vision 모델로 별도 호출 (스트리밍)
+            _vision_model = "gpt-4o-mini"
+            _vision_payload = {
+                "model": _vision_model,
+                "instructions": "You are a vision assistant. Analyze images thoroughly and respond in the same language as the user's prompt.",
+                "input": [{"role": "user", "content": [
+                    {"type": "input_text", "text": user_prompt},
+                    img_part,
+                ]}],
+                "store": False,
+                "stream": True,
+            }
+            _parts: list[str] = []
+            for _ev in _iter_events(_vision_payload):
+                if _ev.get("type") == "response.output_text.delta":
+                    _parts.append(_ev.get("delta", ""))
+                elif _ev.get("type") == "_error":
+                    return f"이미지 분석 오류: {_ev.get('message', '')}"
+            result = "".join(_parts).strip()
+            return result or "(이미지 분석 결과 없음)"
         else:
             return f"Unknown tool: {name}"
     except Exception as e:
@@ -2872,7 +2928,6 @@ def run_worker(prompt: str, workdir: str, model: str | None,
     model = model or DEFAULT_WORKER_MODEL
     system_prompt = system_prompt or WORKER_SYSTEM
     tools = tools if tools is not None else WORKER_TOOLS
-    _use_builtin_search = any(t.get("type") == "web_search_preview" for t in tools)
     status_ref[0] = "running"
 
     # 입력 히스토리 (user msg + function_call + function_call_output 누적)
@@ -2906,57 +2961,29 @@ def run_worker(prompt: str, workdir: str, model: str | None,
         fc_items: list[dict] = []   # {call_id, name, arguments}
         got_error = False
 
-        _builtin_search_error = False
         for ev in _iter_events(payload):
             evtype = ev["type"]
             if evtype == "_error":
-                msg = ev.get("message", "")
-                # built-in web_search_preview 미지원 오류 → 재시도
-                if _use_builtin_search and ("web_search" in msg.lower() or "unknown" in msg.lower() or "invalid" in msg.lower()):
-                    _builtin_search_error = True
-                    got_error = False  # 오류 아님 — 재시도할 것
-                else:
-                    buf.append(f"[red]API 오류: {msg}[/red]")
-                    status_ref[0] = "error"
-                    if line_buf.strip():
-                        buf.append(colorize_line(line_buf))
-                    got_error = True
+                buf.append(f"[red]API 오류: {ev['message']}[/red]")
+                status_ref[0] = "error"
+                if line_buf.strip():
+                    buf.append(colorize_line(line_buf))
+                got_error = True
                 break
             elif evtype == "response.output_text.delta":
                 delta = ev.get("delta", "")
                 text_parts.append(delta)
                 _flush_line(delta)
-            elif evtype == "response.output_item.done":
-                item = ev.get("item", {})
-                item_type = item.get("type", "")
-                if item_type == "function_call":
-                    fc_items.append({
-                        "call_id": item["call_id"],
-                        "name":    item["name"],
-                        "arguments": item["arguments"],
-                    })
-                elif item_type == "web_search_call":
-                    # 내장 web_search_preview — API가 직접 실행, 쿼리만 표시
-                    query = item.get("action", {}).get("query", "") if isinstance(item.get("action"), dict) else ""
-                    if not query:
-                        # 다른 구조 시도
-                        for act in (item.get("actions") or []):
-                            if isinstance(act, dict) and act.get("query"):
-                                query = act["query"]
-                                break
-                    buf.append(f"[dim]🔍 검색: {query or '(web search)'}[/dim]")
+            elif evtype == "response.output_item.done" and ev.get("item", {}).get("type") == "function_call":
+                item = ev["item"]
+                fc_items.append({
+                    "call_id": item["call_id"],
+                    "name":    item["name"],
+                    "arguments": item["arguments"],
+                })
 
         if got_error:
             return "\n".join(all_text_parts), 1
-
-        # built-in web_search_preview 미지원 → 해당 툴 제거 후 이번 round 재시도
-        if _builtin_search_error:
-            buf.append("[dim]내장 web_search 미지원 — 커스텀 web_search로 전환[/dim]")
-            tools = [t for t in tools if t.get("type") != "web_search_preview"]
-            _use_builtin_search = False
-            text_parts = []
-            fc_items = []
-            continue  # 같은 round 재시도
 
         round_text = "".join(text_parts)
         if round_text:
