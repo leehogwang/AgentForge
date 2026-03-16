@@ -302,7 +302,7 @@ LEGACY_SESSION_FILE = Path.home() / ".agentforge" / "last_session.json"
 DEFAULT_MAX_ITER = 5000
 WORKER_BUF_LINES = 60
 DEFAULT_WORKER_MODEL = "gpt-5.4"
-DEFAULT_EVAL_MODEL = "gpt-5.1-codex-mini"
+DEFAULT_EVAL_MODEL = "gpt-5.4"
 CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07')
 DECISION_RE = re.compile(
@@ -1766,6 +1766,10 @@ WORKER_SYSTEM = textwrap.dedent("""\
     Make concrete, real code changes — do not just describe what to do.
     Be thorough and complete.
 
+    To achieve the user's goal, actively leverage internet resources — research papers,
+    GitHub repositories, technical blog posts, and documentation. Do not rely solely on
+    your existing knowledge; search for the latest techniques and implementations first.
+
     Start your response with: HYPOTHESIS: <one sentence — what approach you're taking and why>
 
     GENERALIZATION RULES (strictly enforced — the evaluator will reject violations):
@@ -1806,11 +1810,28 @@ WORKER_SYSTEM = textwrap.dedent("""\
     - Use print(..., flush=True) so logs appear in real-time.
     - If using tqdm, use tqdm(disable=not sys.stdout.isatty()) or redirect to stderr.
     - Violating this rule makes the monitor blind — it cannot judge progress or stop bad runs.
+
+    EVALUATION INTEGRITY RULE (strictly enforced):
+    - Model inputs at inference time must be ONLY what is genuinely available
+      in real-world deployment — no labels, no annotations, no metadata that
+      wouldn't exist when the model is actually used.
+    - NEVER use as model input: category labels, quantity/scale hints, dataset
+      source identifiers, or any value parsed from filenames, directory structure,
+      or ground-truth annotations. These exist only during training/evaluation,
+      not in production.
+    - This applies regardless of how it's implemented: nn.Embedding lookups,
+      bias terms, conditioning vectors, auxiliary heads, etc.
+    - Violating this rule makes evaluation metrics meaningless.
 """).strip()
 
 EVALUATOR_SYSTEM = textwrap.dedent("""\
     You are a strict code reviewer. You do NOT modify any files.
     Evaluate whether the goal has been achieved.
+
+    The worker is expected to actively leverage internet resources — research papers,
+    GitHub repositories, and technical references. Reward approaches that incorporate
+    well-researched, up-to-date techniques. Flag approaches that ignore available
+    literature when better-known methods exist.
 
     EXPLORATION PHASE RULE (check this FIRST):
     - If the worker's output consists primarily of file reads, directory listings,
@@ -1855,6 +1876,14 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
 
     After IMPROVE or REDIRECT, write the feedback in Korean if possible.
     Do NOT write anything before the decision keyword.
+
+    DATA CONTAMINATION CHECK (applies to ML training/evaluation goals):
+    - Check whether the model's forward pass uses any value at inference time
+      that would not be available in real-world deployment (e.g. category labels,
+      scale/quantity hints, dataset source IDs parsed from filenames or metadata).
+    - If contamination is found: immediately issue REDIRECT identifying the exact
+      parameter and explaining why it invalidates the evaluation metrics.
+    - Low error achieved by consuming ground-truth annotations is NOT a solution.
 
     ML TRAINING TASK RULE (applies ONLY when the goal explicitly involves model training, fine-tuning, or ML evaluation):
     - If worker output shows a background ML training was STARTED (keywords: "train", "학습", "fine-tun", "epoch", "model") AND PID mentioned, but NO evaluation results (PMAE %, accuracy, loss from evaluate.py) yet:
@@ -2304,7 +2333,17 @@ MONITOR_EVALUATOR_SYSTEM = textwrap.dedent("""\
       DONE          — training completed AND final checkpoint saved
       KILL: <reason> — stop training early (see conditions below)
 
+    CRASH DETECTION (check this FIRST before anything else):
+      - If the log contains "Traceback (most recent call last)", "error: unrecognized arguments",
+        "CUDA out of memory", "Segmentation fault", "Killed", or the log ends with a Python/argparse
+        error message → immediately issue KILL.
+      - An argparse usage/help printout with no epoch output means the script crashed before starting.
+      - If no epoch-level metrics appear after 3+ polls → the script likely crashed silently. KILL.
+      - When issuing KILL due to a crash: analyze the root cause from the log and include it in your
+        message so the worker knows exactly what to fix before retrying.
+
     KILL conditions (any one is sufficient):
+      - Script crashed before starting (argparse error, import error, etc.)
       - NaN or exploding loss/gradients
       - Fatal error or crash in log
       - Metric has NOT improved for 10+ consecutive epochs/steps
@@ -3688,7 +3727,7 @@ def _parse_monitor_decision(text: str) -> tuple[str, str]:
         if first_line.upper().startswith(kw):
             rest = first_line[len(kw):].lstrip(' :—–-').strip()
             return kw, rest
-    return parse_decision(text)
+    return 'CONTINUE', f"(parse failed) {text[:200]}"
 
 
 def _run_monitor_loop(bg: dict, goal: str, workdir: str, eval_model: str | None,
