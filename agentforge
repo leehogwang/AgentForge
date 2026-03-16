@@ -839,25 +839,6 @@ WORKER_TOOLS = [
 ]
 
 
-_VISION_TOOLS = [
-    {
-        "type": "function", "name": "view_image",
-        "description": (
-            "Analyze an image file or URL. Returns a detailed text description "
-            "including any text, charts, diagrams, or visual elements."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path":   {"type": "string", "description": "Local file path to the image"},
-                "url":    {"type": "string", "description": "URL of the image"},
-                "prompt": {"type": "string", "description": "Optional: specific question about the image"},
-            },
-        },
-        "strict": False,
-    },
-]
-
 _WEB_TOOLS = [
     {
         "type": "function", "name": "web_search",
@@ -878,7 +859,7 @@ _WEB_TOOLS = [
 ]
 
 # Codex 내장 web_search (API가 직접 실행 — 우선 사용)
-WORKER_TOOLS = WORKER_TOOLS + _VISION_TOOLS + _WEB_TOOLS
+WORKER_TOOLS = WORKER_TOOLS + _WEB_TOOLS
 RESEARCH_TOOLS = WORKER_TOOLS
 
 
@@ -999,7 +980,10 @@ def _execute_tool(name: str, args: dict, workdir: str, worker_id: int = 0) -> st
                 )
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+                    if hasattr(os, 'killpg'):
+                        os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+                    else:
+                        proc.kill()
                 except (ProcessLookupError, OSError):
                     pass
                 proc.wait()
@@ -1198,73 +1182,6 @@ def _execute_tool(name: str, args: dict, workdir: str, worker_id: int = 0) -> st
             text = re.sub(r'<[^>]+>', ' ', r.text)
             text = re.sub(r'\s+', ' ', text).strip()
             return text[:8000]
-        elif name == "view_image":
-            import base64 as _b64
-            path_or_url = args.get("path") or args.get("url", "")
-            if not path_or_url:
-                return "Error: path 또는 url 인자가 필요합니다."
-            user_prompt = args.get("prompt", "이 이미지를 자세히 분석해주세요. 텍스트가 있으면 그대로 옮기고, 차트/그래프라면 수치도 설명해주세요.")
-
-            # 이미지 바이트 로드
-            if path_or_url.startswith(("http://", "https://")):
-                _img_bytes = requests.get(path_or_url, timeout=15).content
-                _ext = path_or_url.split('?')[0].rsplit('.', 1)[-1].lower()
-            else:
-                with open(path_or_url, "rb") as _f:
-                    _img_bytes = _f.read()
-                _ext = Path(path_or_url).suffix.lower().lstrip('.')
-            _mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-                     "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp"}.get(_ext, "image/jpeg")
-            _b64str = _b64.b64encode(_img_bytes).decode()
-            _data_url = f"data:{_mime};base64,{_b64str}"
-
-            # 1순위: HuggingFace Inference API (HF_TOKEN 또는 HUGGINGFACE_TOKEN)
-            _hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
-            if _hf_token:
-                try:
-                    _hf_r = requests.post(
-                        "https://api-inference.huggingface.co/models/meta-llama/Llama-3.2-11B-Vision-Instruct/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {_hf_token}"},
-                        json={"model": "meta-llama/Llama-3.2-11B-Vision-Instruct",
-                              "messages": [{"role": "user", "content": [
-                                  {"type": "text", "text": user_prompt},
-                                  {"type": "image_url", "image_url": {"url": _data_url}},
-                              ]}],
-                              "max_tokens": 1024},
-                        timeout=60,
-                    )
-                    if _hf_r.ok:
-                        return _hf_r.json()["choices"][0]["message"]["content"].strip()
-                except Exception:
-                    pass
-
-            # 2순위: OpenAI API (OPENAI_API_KEY)
-            _oai_key = os.environ.get("OPENAI_API_KEY")
-            if _oai_key:
-                try:
-                    _oai_r = requests.post(
-                        "https://api.openai.com/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {_oai_key}"},
-                        json={"model": "gpt-4o-mini",
-                              "messages": [{"role": "user", "content": [
-                                  {"type": "text", "text": user_prompt},
-                                  {"type": "image_url", "image_url": {"url": _data_url}},
-                              ]}],
-                              "max_tokens": 1024},
-                        timeout=60,
-                    )
-                    if _oai_r.ok:
-                        return _oai_r.json()["choices"][0]["message"]["content"].strip()
-                except Exception:
-                    pass
-
-            return (
-                f"[이미지 분석 불가] 현재 백엔드(chatgpt.com)는 vision 입력을 지원하지 않습니다.\n"
-                f"이미지를 분석하려면 환경변수를 설정하세요:\n"
-                f"  HF_TOKEN=<huggingface.co 토큰>  (무료)\n"
-                f"  OPENAI_API_KEY=<OpenAI API 키>\n"
-                f"파일: {path_or_url}"
-            )
         else:
             return f"Unknown tool: {name}"
     except Exception as e:
@@ -1867,19 +1784,18 @@ WORKER_SYSTEM = textwrap.dedent("""\
     - Use the data_profile tool on any dataset before modeling to get feature engineering suggestions
 
     LONG-RUNNING TASK RULE (strictly enforced):
-    - For ANY training/fine-tuning/long computation (expected > 1 minute), you MUST use
-      shell_background — NEVER use shell for training jobs.
-    - shell_background returns PID and LOG path, which enables the monitor to watch progress
-      and kill the job early if it's not converging toward the goal.
+    - For ANY command expected to take more than 1 minute (training, evaluation, data processing,
+      web crawling, large file operations, etc.), you MUST use shell_background — NEVER use shell.
+    - If unsure whether it will take over 1 minute, use shell_background to be safe.
+    - shell_background returns PID and LOG path, which enables the monitor to watch progress.
     - After launching with shell_background, briefly summarize what was launched and why,
       then end your turn. Do NOT wait or poll — the monitor will take over.
-    - Using shell for training bypasses all monitoring and wastes GPU time on bad runs.
 
     FILE PATH RULE (strictly enforced):
     - When the user provides a file path (e.g. "D:\image_getter\file.png"), use it EXACTLY as given.
     - NEVER convert Windows paths to Unix/Linux paths (D:\foo → /mnt/data/foo is WRONG).
     - NEVER convert Unix paths to Windows paths.
-    - Pass the exact path string directly to view_image, read_file, shell, etc.
+    - Pass the exact path string directly to read_file, shell, etc.
 
     TRAINING LOG FORMAT RULE (strictly enforced in all training scripts you write):
     - NEVER print inside data loading, preprocessing, KNN building, or per-sample loops.
@@ -1906,8 +1822,8 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
     - Actively scan the worker's code for: hardcoded magic values, special-cased
       conditions like `if x == <specific_value>`, lookup tables that memorize
       expected outputs, or any logic that only works for the exact example in the goal.
-    - If ANY hardcoding is found: immediately issue REDIRECT with a message like
-      "하드코딩 감지: <파일/라인 위치> — 특정 케이스 땜질 금지. 루트 원인을 수정하라."
+    - If ANY hardcoding is found: immediately issue REDIRECT identifying the exact file
+      and line where hardcoding was found, and explaining what the correct general solution should be.
     - A solution that passes the given example by memorizing it is NOT DONE — it is REDIRECT.
     - Only proceed to evaluate correctness after confirming there is no hardcoding.
 
@@ -1940,12 +1856,11 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
     After IMPROVE or REDIRECT, write the feedback in Korean if possible.
     Do NOT write anything before the decision keyword.
 
-    LONG-RUNNING TASK RULE:
-    - If worker output shows a background training/task was STARTED (PID mentioned,
-      "training started", "학습 시작", "백그라운드에서 시작" etc.) but NO evaluation
-      results (PMAE %, accuracy numbers, loss values from evaluate.py) are shown yet:
-      → Give IMPROVE: "학습이 완료됐지만 평가가 실행되지 않았습니다. evaluate.py를 실행해 PMAE 수치를 측정하고 보고하세요."
-      → Do NOT give REDIRECT just because numeric metrics aren't shown yet.
+    ML TRAINING TASK RULE (applies ONLY when the goal explicitly involves model training, fine-tuning, or ML evaluation):
+    - If worker output shows a background ML training was STARTED (keywords: "train", "학습", "fine-tun", "epoch", "model") AND PID mentioned, but NO evaluation results (PMAE %, accuracy, loss from evaluate.py) yet:
+      → Give IMPROVE explaining that training has completed but evaluation has not been run yet,
+        and instruct the worker to run the evaluation script and report the resulting metrics.
+      → Do NOT apply this rule if the background task is data collection, web scraping, file processing, or anything unrelated to ML training.
       → Do NOT give DONE unless actual evaluation results confirm the goal is met.
     - If the [BACKGROUND TRAINING COMPLETED] section appears in the worker output:
       → Training has already finished. Evaluate whether the worker ran evaluate.py afterwards.
@@ -2474,7 +2389,7 @@ DUAL_EVALUATOR_SYSTEM = textwrap.dedent("""\
     HARDCODING DETECTION (only when actual code or trained output exists):
     - Scan for hardcoded magic values, special-cased conditions, or logic that only
       works for the exact example in the goal.
-    - If found: REDIRECT with "하드코딩 감지: <위치> — 루트 원인을 수정하라."
+    - If found: REDIRECT identifying the exact location and explaining the correct general fix.
     - A solution that passes by memorizing the example is NOT DONE — it is REDIRECT.
 
     Respond with EXACTLY ONE first-line decision:
@@ -3731,45 +3646,23 @@ def _is_proc_alive(pid: int, proc) -> bool:
         return False
 
 
-def _extract_metric_trend(log_tail: str) -> str:
-    """로그에서 PMAE/loss/accuracy 숫자를 추출해 트렌드 요약을 반환."""
-    import re as _re
-    patterns = [
-        (_re.compile(r'(?i)pmae[=:\s]+(\d+\.?\d*)\s*%?'), 'PMAE'),
-        (_re.compile(r'(?i)val(?:_loss)?[=:\s]+(\d+\.?\d*)'), 'val_loss'),
-        (_re.compile(r'(?i)(?<!\w)loss[=:\s]+(\d+\.?\d*)'), 'loss'),
-        (_re.compile(r'(?i)acc(?:uracy)?[=:\s]+(\d+\.?\d*)\s*%?'), 'acc'),
-        (_re.compile(r'(?i)mae[=:\s]+(\d+\.?\d*)'), 'MAE'),
-    ]
-    results = []
-    for pat, name in patterns:
-        vals = [float(m.group(1)) for m in pat.finditer(log_tail)]
-        if len(vals) >= 2:
-            trend = vals[-1] - vals[0]
-            direction = "↓" if trend < 0 else "↑"
-            results.append(
-                f"  {name}: {vals[0]:.3f} → {vals[-1]:.3f} "
-                f"({direction}{abs(trend):.3f} over {len(vals)} data points, "
-                f"latest={vals[-1]:.3f})"
-            )
-    return "\n".join(results) if results else "  (no numeric metrics detected in log)"
 
 
 def _build_monitor_prompt(goal: str, log_tail: str, pid: int,
-                           elapsed: float, poll_count: int) -> str:
-    trend_summary = _extract_metric_trend(log_tail)
+                           elapsed: float, poll_count: int,
+                           command: str = "") -> str:
     return "\n".join([
         f"TRAINING GOAL: {goal}",
         f"PID: {pid}  |  Elapsed: {int(elapsed // 60)}m {int(elapsed % 60)}s  |  Poll #{poll_count}",
-        "",
-        "METRIC TREND SUMMARY (auto-extracted from log):",
-        trend_summary,
         "",
         "TRAINING LOG (last 200 lines):",
         "─" * 60,
         log_tail.strip(),
         "─" * 60,
         "",
+        "Read the log above directly to judge progress.",
+        "Look for epoch numbers, metric values (PMAE, loss, accuracy, etc.), errors, and trends.",
+        "Compare current metrics against the TRAINING GOAL to determine if the goal is reachable.",
         "First line: CONTINUE, DONE, or KILL: <reason>",
     ])
 
@@ -3832,8 +3725,9 @@ def _run_monitor_loop(bg: dict, goal: str, workdir: str, eval_model: str | None,
         bg["last_poll_at"] = time.time()
         elapsed = time.time() - bg["started_at"]
 
-        log_tail = _read_log_tail(log_path)
-        monitor_prompt = _build_monitor_prompt(goal, log_tail, pid, elapsed, bg["poll_count"])
+        log_tail = _read_log_tail(log_path, lines=30)
+        monitor_prompt = _build_monitor_prompt(goal, log_tail, pid, elapsed, bg["poll_count"],
+                                               command=bg.get("command", ""))
 
         refresh("evaluator", iteration)
         eval_msg, _ = run_evaluator(monitor_prompt, workdir, eval_model,
@@ -3860,7 +3754,10 @@ def _run_monitor_loop(bg: dict, goal: str, workdir: str, eval_model: str | None,
             return "DONE"
         elif decision == "KILL":
             try:
-                os.killpg(os.getpgid(pid), _signal.SIGKILL)
+                if hasattr(os, 'killpg'):
+                    os.killpg(os.getpgid(pid), _signal.SIGKILL)
+                else:
+                    os.kill(pid, _signal.SIGTERM)
                 if proc:
                     proc.wait()
             except (ProcessLookupError, OSError):
@@ -4857,6 +4754,7 @@ def _interactive_controller(args, workdir: str, max_iter: int, ui: InteractiveSh
 
     def _resume_saved_session() -> None:
         nonlocal current_goal
+        global _last_session
         if not _last_session:
             _last_session = _load_persisted_session()
         if not _last_session:
