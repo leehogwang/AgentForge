@@ -315,7 +315,8 @@ _pending_bg_job: "dict | None" = None
 _pending_bg_job_lock = threading.Lock()
 NOISE_RE = re.compile(r'^\s*([\-─═\s]+)?$')
 STAGNATION_THRESHOLD = 3   # N회 연속 정체 시 A/B 전략 발동
-_AB_PICK_RE = re.compile(r'PICK:([AB])', re.I)
+_AB_PICK_RE  = re.compile(r'PICK:([AB])', re.I)
+_AB_RETRY_RE = re.compile(r'\bRETRY\b', re.I)
 _TASK_RE     = re.compile(r'^TASK_([AB]):\s*(.+?)$', re.I | re.M)
 _GPU_RE      = re.compile(
     r'CUDA_VISIBLE_DEVICES\s*=\s*(\d+)'
@@ -1201,8 +1202,9 @@ SLASH_COMMANDS = [
     ("/exit",            "종료"),
     ("/mode code",       "코딩 모드로 전환"),
     ("/mode research",   "연구 모드로 전환"),
-    ("/mode dual",    "Dual-Worker 모드 (Coordinator → W1+W2 병렬)"),
-    ("/mode single",  "단일 Worker 모드로 복귀"),
+    ("/mode dual",       "Dual-Worker 모드 (Coordinator → W1+W2 병렬)"),
+    ("/mode single",     "단일 Worker 모드로 복귀"),
+    ("/mode one_dual",   "One-Dual 모드 (매 iter A/B 코드 제안 → 평가자 선택 → 학습)"),
     ("/eval-every <N>",  "N번마다 Evaluator 실행"),
     ("/dir <path>",      "작업 디렉토리 변경"),
     ("/status",          "현재 설정 확인"),
@@ -1896,6 +1898,23 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
       → If evaluation was NOT run: IMPROVE with instruction to run it.
       → If evaluation WAS run and metrics meet the goal: DONE.
       → If evaluation WAS run and metrics don't meet the goal: IMPROVE or REDIRECT as appropriate.
+
+    TRAINING MONITOR MODE (when a training log is provided instead of worker output):
+    You are called every few minutes while a background training job is running.
+    In this mode, the input contains a TRAINING GOAL, a TRAINING LOG tail, and optionally a MONITOR REPORT.
+
+    Check for crashes FIRST:
+    - If the log contains "Traceback", "error: unrecognized arguments", "CUDA out of memory",
+      "Segmentation fault", "Killed", or any Python/argparse error → REDIRECT immediately,
+      include the exact error so the worker knows what to fix.
+    - No epoch-level metrics after 3+ polls → likely crashed silently → REDIRECT.
+
+    Then judge progress:
+    - CONTINUE: training is actively progressing, metrics improving, goal still reachable.
+    - DONE: training finished AND the reported metrics actually meet the training goal.
+      Do NOT declare DONE if metrics are logged but do not satisfy the goal.
+    - REDIRECT: training finished but metrics do not meet the goal, OR goal is clearly
+      unreachable given current trend (explain why and suggest a different approach).
 """).strip()
 
 RESEARCH_WORKER_SYSTEM = textwrap.dedent("""\
@@ -2325,44 +2344,45 @@ AB_COMPARE_SYSTEM = textwrap.dedent("""\
     Do NOT write anything before PICK:A or PICK:B.
 """).strip()
 
+AB_COMPARE_CODE_SYSTEM = textwrap.dedent("""\
+    당신은 기존 평가자다. 입력으로 GOAL, 전략 A 코드, 전략 B 코드가 주어진다.
+    GOAL 달성 관점에서 두 접근법의 장단점을 자유롭게 분석하고 의견을 말하라.
+
+    마지막에 반드시 다음 중 하나를 명시하라:
+      PICK:A  — A 접근법으로 학습을 진행한다
+      PICK:B  — B 접근법으로 학습을 진행한다
+      RETRY   — 두 접근법 모두 불충분, 재시도 요청
+
+    RETRY는 두 접근법 모두 이전 시도와 다를 바 없거나, 명백히 구현 불가능하거나,
+    GOAL 달성 가능성이 없다고 판단될 때만 사용하라.
+    RETRY 사용 시 무엇이 부족한지, 다음 시도에서 무엇을 바꿔야 하는지 구체적으로 설명하라.
+""").strip()
+
 MONITOR_EVALUATOR_SYSTEM = textwrap.dedent("""\
-    You are a training monitor. Analyze the training log and metric trends to decide whether to continue, declare done, or kill the job early.
+    You are a training monitor. Your ONLY job is to observe the training log and report
+    what you see. You do NOT make final decisions — the evaluator decides what to do next.
 
     Response format — first line must be exactly one of:
-      CONTINUE      — metric is improving, training should proceed
-      DONE          — training completed AND final checkpoint saved
-      KILL: <reason> — stop training early (see conditions below)
+      CONTINUE               — training is actively progressing, nothing to report yet
+      ALERT: <description>   — something requires the evaluator's attention (see below)
 
-    CRASH DETECTION (check this FIRST before anything else):
-      - If the log contains "Traceback (most recent call last)", "error: unrecognized arguments",
-        "CUDA out of memory", "Segmentation fault", "Killed", or the log ends with a Python/argparse
-        error message → immediately issue KILL.
-      - An argparse usage/help printout with no epoch output means the script crashed before starting.
-      - If no epoch-level metrics appear after 3+ polls → the script likely crashed silently. KILL.
-      - When issuing KILL due to a crash: analyze the root cause from the log and include it in your
-        message so the worker knows exactly what to fix before retrying.
+    Issue ALERT when ANY of the following is true:
+      - The log contains "Traceback", "error: unrecognized arguments", "CUDA out of memory",
+        "Segmentation fault", "Killed", or any Python/argparse error → crashed before starting
+      - No epoch-level metrics appear after 3+ polls → likely crashed silently
+      - Training completed (log shows "final result", "Training complete", checkpoint saved)
+      - Metrics are reported but look catastrophically wrong (e.g. PMAE > 1000%)
+      - Loss is NaN or exploding
+      - Metric has not improved for 10+ consecutive epochs
+      - Extrapolated trend shows the goal metric is clearly unreachable
 
-    KILL conditions (any one is sufficient):
-      - Script crashed before starting (argparse error, import error, etc.)
-      - NaN or exploding loss/gradients
-      - Fatal error or crash in log
-      - Metric has NOT improved for 10+ consecutive epochs/steps
-      - Extrapolated trend shows the TARGET METRIC is UNREACHABLE before training ends
-        (e.g., goal is PMAE ≤ 15%, current PMAE is 35% after 60%+ of epochs with flat/slow trend)
-      - Loss is consistently increasing (wrong direction)
+    In your ALERT description, include:
+      1. What you observed (exact log lines if relevant)
+      2. Why it needs attention (crash / completion / bad metrics / plateau)
+      3. Current metric values vs the training goal
 
-    CONTINUE conditions:
-      - Metric is steadily improving toward the goal
-      - Some plateau but still within first 30% of training
-      - Recent improvement visible in last logged epochs
-
-    DONE conditions:
-      - Log contains "Training complete", "Finished training", or equivalent AND best checkpoint saved
-      - Process exited cleanly with final metrics logged
-
-    Pay special attention to the METRIC TREND SUMMARY provided — use it to judge convergence trajectory.
-    Always include 1-2 sentences of reasoning after the decision keyword.
     Do NOT write anything before the decision keyword.
+    Do NOT issue DONE or KILL — that is the evaluator's responsibility.
 """).strip()
 
 PAPER_EXTRACTOR_SYSTEM = textwrap.dedent("""\
@@ -3263,8 +3283,8 @@ def render_worker_panel(buf: deque, iteration: int, status: str,
 def render_evaluator_panel(eval_history: list, iteration: int,
                            phase: str, done: bool) -> Panel:
     lines = []
-    # 오래된 기록 (최신 제외): 배지 + 요약 한 줄
-    for e in eval_history[:-1]:
+    # 최근 기록만 표시 (최신 제외): 배지 + 요약 한 줄
+    for e in eval_history[-15:-1]:
         d, fb = e['decision'], e['feedback']
         short_fb = fb[:65] + ('…' if len(fb) > 65 else '')
         if e.get('type') == 'monitor':
@@ -3413,29 +3433,100 @@ def _tmux_reconnect(workdir: str):
 
 # ── Checkpoint / Rollback ────────────────────────────────────────────────────
 
+_CP_CODE_EXTS = {'.py', '.sh', '.yaml', '.yml', '.json', '.toml', '.cfg', '.ini', '.txt', '.md'}
+_CP_SKIP_DIRS = {'__pycache__', '.ipynb_checkpoints', 'node_modules',
+                 'wandb', 'checkpoints', 'runs', 'logs', '.git'}
+_CP_MAX_FILE  = 10 * 1024 * 1024  # 10 MB
+
+
 def _cp_save(workdir: str) -> str | None:
-    """현재 uncommitted 변경사항을 patch 파일로 저장.
-    반환: 파일경로 | 'empty'(변경없음) | None(git없음/실패)"""
-    if not (Path(workdir) / ".git").exists():
-        return None
+    """workdir 코드 파일을 스냅샷으로 저장.
+    git이 있으면 git patch, 없으면 파일 복사 스냅샷.
+    반환: 경로(str) | 'empty' | None(실패)"""
+    if (Path(workdir) / ".git").exists():
+        try:
+            r = subprocess.run(
+                ["git", "diff", "HEAD", "--binary"],
+                capture_output=True, text=True, cwd=workdir, timeout=10,
+            )
+            if not r.stdout.strip():
+                return "empty"
+            p = Path(workdir) / f".agentforge_cp_{int(time.time()*1000)}.patch"
+            p.write_text(r.stdout)
+            return str(p)
+        except Exception:
+            pass  # fall through to file-copy
+
+    # git 없음 → 파일 복사 스냅샷 (tmp 디렉토리)
     try:
-        r = subprocess.run(
-            ["git", "diff", "HEAD", "--binary"],
-            capture_output=True, text=True, cwd=workdir, timeout=10,
-        )
-        if not r.stdout.strip():
-            return "empty"
-        p = Path(workdir) / f".agentforge_cp_{int(time.time()*1000)}.patch"
-        p.write_text(r.stdout)
-        return str(p)
+        import tempfile as _tmpmod
+        snap_dir = Path(_tmpmod.mkdtemp(prefix="agentforge_snap_"))
+        workdir_path = Path(workdir)
+        saved: list[str] = []
+        for root, dirs, files in os.walk(workdir_path):
+            dirs[:] = [d for d in dirs if d not in _CP_SKIP_DIRS]
+            rel_root = Path(root).relative_to(workdir_path)
+            for fname in files:
+                fpath = Path(root) / fname
+                if fpath.suffix not in _CP_CODE_EXTS:
+                    continue
+                try:
+                    if fpath.stat().st_size > _CP_MAX_FILE:
+                        continue
+                except OSError:
+                    continue
+                dest_dir = snap_dir / rel_root
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                _shutil.copy2(fpath, dest_dir / fname)
+                saved.append(str(rel_root / fname))
+        (snap_dir / ".agentforge_filelist").write_text("\n".join(saved))
+        return str(snap_dir)
     except Exception:
         return None
 
 
 def _cp_restore(workdir: str, patch_path: str | None) -> bool:
-    """patch 파일로 workdir 복원 (현재 변경 전부 취소 후 적용). True=성공."""
+    """스냅샷으로 workdir 복원. True=성공."""
     if patch_path is None:
         return False
+
+    # 디렉토리 스냅샷 (non-git)
+    if Path(patch_path).is_dir():
+        try:
+            snap_dir = Path(patch_path)
+            workdir_path = Path(workdir)
+            filelist_path = snap_dir / ".agentforge_filelist"
+            filelist = set(filelist_path.read_text().splitlines()) if filelist_path.exists() else set()
+
+            # 스냅샷 이후 새로 생긴 코드 파일 삭제
+            for root, dirs, files in os.walk(workdir_path):
+                dirs[:] = [d for d in dirs if d not in _CP_SKIP_DIRS]
+                rel_root = Path(root).relative_to(workdir_path)
+                for fname in files:
+                    fpath = Path(root) / fname
+                    if fpath.suffix not in _CP_CODE_EXTS:
+                        continue
+                    if str(rel_root / fname) not in filelist:
+                        try:
+                            fpath.unlink()
+                        except OSError:
+                            pass
+
+            # 원본 파일 복원
+            for root, dirs, files in os.walk(snap_dir):
+                rel_root = Path(root).relative_to(snap_dir)
+                for fname in files:
+                    if fname == ".agentforge_filelist":
+                        continue
+                    src = Path(root) / fname
+                    dest_dir = workdir_path / rel_root
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    _shutil.copy2(src, dest_dir / fname)
+            return True
+        except Exception:
+            return False
+
+    # git patch
     try:
         subprocess.run(["git", "checkout", "."], capture_output=True, cwd=workdir, timeout=10)
         subprocess.run(["git", "clean", "-fd"], capture_output=True, cwd=workdir, timeout=10)
@@ -3451,11 +3542,16 @@ def _cp_restore(workdir: str, patch_path: str | None) -> bool:
 
 
 def _cp_delete(patch_path: str | None) -> None:
-    if patch_path and patch_path != "empty":
-        try:
-            Path(patch_path).unlink(missing_ok=True)
-        except Exception:
-            pass
+    if not patch_path or patch_path == "empty":
+        return
+    try:
+        p = Path(patch_path)
+        if p.is_dir():
+            _shutil.rmtree(p, ignore_errors=True)
+        else:
+            p.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _detect_gpu_in_command(cmd: str) -> int | None:
@@ -3553,105 +3649,157 @@ def _run_ab_strategy(
     worker_model: str | None, worker_sys: str, active_tools: list,
     eval_model: str | None, past_attempts: list,
     worker_buf: deque, iteration: int, refresh,
+    code_only: bool = False,
 ) -> tuple[str | None, str]:
     """
     2개의 Worker를 서로 다른 전략으로 순차 실행하고 Evaluator가 더 나은 쪽 채택.
-    반환: (selected_output, "A" | "B" | "interrupted")
+    code_only=True: workers는 코드 작성만(학습 실행 X), 평가자가 코드/접근법 비교.
+                    평가자가 RETRY하면 최대 3회 재시도. 한도 초과 시 "no_pick" 반환.
+    반환: (selected_output, "A" | "B" | "interrupted" | "no_pick")
     """
     base_patch = _cp_save(workdir)
     if base_patch is None:
-        worker_buf.append("[yellow]⚠ git 없음 — A/B 분기는 git 저장소에서만 동작합니다. 단일 Worker로 계속합니다.[/yellow]")
-        return None, "no_git"
+        worker_buf.append("[yellow]⚠ 스냅샷 저장 실패 — 단일 Worker로 계속합니다.[/yellow]")
+        return None, "no_pick"
 
-    HINTS = [
+    DEFAULT_HINTS = [
         "\n\n[STRATEGY A] 이전에 시도한 방법과 완전히 다른 접근법을 사용하라. 기존 시도와 겹치는 방법은 금지.",
         "\n\n[STRATEGY B] 문제를 가장 작은 단위로 분해하여 핵심 원인부터 해결하라. 가장 기본적이고 단순한 것부터 시작.",
     ]
 
-    outputs: list[str] = []
-    patches: list[str | None] = []   # base + 각 전략 적용 후 전체 patch
+    MAX_CODE_RETRIES = 3
+    retry_feedback = ""
+    chosen: str | None = None
+    final_outputs: list[str] = []
+    final_patches: list[str | None] = []
 
-    for i, (label, hint) in enumerate([("A", HINTS[0]), ("B", HINTS[1])]):
-        if _interrupt_event.is_set():
-            _cp_delete(base_patch)
-            return None, "interrupted"
+    attempts = range(MAX_CODE_RETRIES) if code_only else range(1)
 
-        if i == 1:
-            # A 실행 후 base 상태로 복원
+    for attempt in attempts:
+        if attempt > 0:
+            worker_buf.append(
+                f"[yellow]↩ A/B 재시도 {attempt}/{MAX_CODE_RETRIES - 1} "
+                f"— {retry_feedback[:80]}[/yellow]"
+            )
+            refresh("worker", iteration)
             _cp_restore(workdir, base_patch)
 
-        worker_buf.append(f"[cyan bold]── 전략 {label} ─────────────────────────────[/cyan bold]")
-        refresh("worker", iteration)
+        if code_only:
+            no_train_suffix = "\n학습 스크립트를 수정/작성하되 학습은 실행하지 마라. 코드 완성 후 멈춰라."
+            feedback_suffix = f"\n[평가자 피드백] {retry_feedback}" if retry_feedback else ""
+            hints = [
+                "\n\n[STRATEGY A] 현재 접근법을 점진적으로 개선하라." + no_train_suffix + feedback_suffix,
+                "\n\n[STRATEGY B] 현재와 완전히 다른 접근법을 제안하라." + no_train_suffix + feedback_suffix,
+            ]
+        else:
+            hints = DEFAULT_HINTS
 
-        prompt = build_worker_prompt(goal, history, past_attempts=past_attempts) + hint
-        buf_tmp: deque = deque(maxlen=WORKER_BUF_LINES)
-        status_tmp = ["idle"]
-        res: list = [None]
+        outputs: list[str] = []
+        patches: list[str | None] = []
 
-        def _w(p=prompt, b=buf_tmp, s=status_tmp):
-            out, _ = run_worker(p, workdir, worker_model, b, s,
-                                system_prompt=worker_sys, tools=active_tools)
-            res[0] = out
-
-        t = threading.Thread(target=_w, daemon=True)
-        t.start()
-        while t.is_alive():
+        for i, (label, hint) in enumerate([("A", hints[0]), ("B", hints[1])]):
             if _interrupt_event.is_set():
-                break
-            for line in list(buf_tmp):
-                worker_buf.append(f"[dim][{label}][/dim] {line}")
-            buf_tmp.clear()
+                _cp_delete(base_patch)
+                return None, "interrupted"
+
+            if i == 1:
+                _cp_restore(workdir, base_patch)
+
+            worker_buf.append(f"[cyan bold]── 전략 {label} ─────────────────────────────[/cyan bold]")
             refresh("worker", iteration)
-            time.sleep(0.1)
-        t.join(timeout=10)
 
-        if _interrupt_event.is_set():
-            _cp_delete(base_patch)
-            return None, "interrupted"
+            prompt = build_worker_prompt(goal, history, past_attempts=past_attempts) + hint
+            buf_tmp: deque = deque(maxlen=WORKER_BUF_LINES)
+            status_tmp = ["idle"]
+            res: list = [None]
 
-        outputs.append(res[0] or "")
-        # 이 전략의 전체 상태를 patch로 저장 (base + 이 전략의 변경)
-        patches.append(_cp_save(workdir))
+            def _w(p=prompt, b=buf_tmp, s=status_tmp):
+                out, _ = run_worker(p, workdir, worker_model, b, s,
+                                    system_prompt=worker_sys, tools=active_tools)
+                res[0] = out
 
-    # ── Evaluator: A vs B 비교 ───────────────────────────────────────────────
-    worker_buf.append("[magenta bold]── Evaluator: 전략 A vs B 비교 중 ──────────[/magenta bold]")
-    refresh("evaluator", iteration)
+            t = threading.Thread(target=_w, daemon=True)
+            t.start()
+            while t.is_alive():
+                if _interrupt_event.is_set():
+                    break
+                for line in list(buf_tmp):
+                    worker_buf.append(f"[dim][{label}][/dim] {line}")
+                buf_tmp.clear()
+                refresh("worker", iteration)
+                time.sleep(0.1)
+            t.join(timeout=10)
 
-    compare_prompt = "\n".join([
-        f"GOAL: {goal}",
-        "",
-        "=== 전략 A 실행 결과 ===",
-        outputs[0][-2000:],
-        "",
-        "=== 전략 B 실행 결과 ===",
-        outputs[1][-2000:],
-        "",
-        "어느 전략이 목표에 더 가까운가?",
-    ])
-    eval_msg, _ = run_evaluator(compare_prompt, workdir, eval_model,
-                                system_prompt=AB_COMPARE_SYSTEM)
+            if _interrupt_event.is_set():
+                _cp_delete(base_patch)
+                return None, "interrupted"
 
-    m = _AB_PICK_RE.search(eval_msg)
-    chosen = m.group(1).upper() if m else "B"
-    worker_buf.append(f"[green bold]✓ 전략 {chosen} 채택됨[/green bold]")
-    refresh("worker", iteration)
+            outputs.append(res[0] or "")
+            patches.append(_cp_save(workdir))
 
+        # ── Evaluator: A vs B 비교 ─────────────────────────────────────────
+        worker_buf.append("[magenta bold]── Evaluator: 전략 A vs B 비교 중 ──────────[/magenta bold]")
+        refresh("evaluator", iteration)
+
+        compare_prompt = "\n".join([
+            f"GOAL: {goal}",
+            "",
+            "=== 전략 A ===" if code_only else "=== 전략 A 실행 결과 ===",
+            outputs[0][-2000:],
+            "",
+            "=== 전략 B ===" if code_only else "=== 전략 B 실행 결과 ===",
+            outputs[1][-2000:],
+            "",
+            "어느 전략이 GOAL에 더 유망한가?" if code_only else "어느 전략이 목표에 더 가까운가?",
+        ])
+        compare_sys = AB_COMPARE_CODE_SYSTEM if code_only else AB_COMPARE_SYSTEM
+        eval_msg, _ = run_evaluator(compare_prompt, workdir, eval_model,
+                                    system_prompt=compare_sys)
+
+        m = _AB_PICK_RE.search(eval_msg)
+        if m:
+            chosen = m.group(1).upper()
+            final_outputs = outputs
+            final_patches = patches
+            break
+
+        if not code_only:
+            # code_only=False: PICK 없으면 B로 fallback (기존 동작 유지)
+            chosen = "B"
+            final_outputs = outputs
+            final_patches = patches
+            break
+
+        # RETRY 경로: 평가자 피드백 저장 후 다음 attempt
+        retry_feedback = eval_msg.strip()[:300]
+        worker_buf.append(f"[yellow]평가자: 재시도 요청 — {retry_feedback[:60]}[/yellow]")
+        refresh("worker", iteration)
+        # patches 정리 (다음 attempt를 위해 base_patch만 남김)
+        for p in patches:
+            _cp_delete(p)
+    else:
+        # 최대 재시도 소진
+        worker_buf.append("[yellow]⚠ A/B 최대 재시도 초과 → 일반 워커로 계속[/yellow]")
+        refresh("worker", iteration)
+        _cp_restore(workdir, base_patch)
+        _cp_delete(base_patch)
+        return None, "no_pick"
+
+    # ── 선택된 전략 적용 ──────────────────────────────────────────────────────
     chosen_idx = 0 if chosen == "A" else 1
     other_idx  = 1 - chosen_idx
 
-    # 선택된 전략의 상태를 workdir에 적용
-    # 현재 상태 = B's patch → chosen이 A면 restore A's patch
+    worker_buf.append(f"[green bold]✓ 전략 {chosen} 채택됨[/green bold]")
+    refresh("worker", iteration)
+
     if chosen == "A":
-        _cp_restore(workdir, patches[0])   # A 상태 복원
-    # chosen == "B": 현재 상태가 이미 B이므로 그대로
+        _cp_restore(workdir, final_patches[0])
 
-    # 패치 파일 정리
     _cp_delete(base_patch)
-    _cp_delete(patches[other_idx])
-    # 선택된 전략의 patch는 이미 적용됐으므로 삭제
-    _cp_delete(patches[chosen_idx])
+    _cp_delete(final_patches[other_idx])
+    _cp_delete(final_patches[chosen_idx])
 
-    return outputs[chosen_idx], chosen
+    return final_outputs[chosen_idx], chosen
 
 
 # ── Training Monitor ──────────────────────────────────────────────────────────
@@ -3694,15 +3842,10 @@ def _build_monitor_prompt(goal: str, log_tail: str, pid: int,
         f"TRAINING GOAL: {goal}",
         f"PID: {pid}  |  Elapsed: {int(elapsed // 60)}m {int(elapsed % 60)}s  |  Poll #{poll_count}",
         "",
-        "TRAINING LOG (last 200 lines):",
+        "TRAINING LOG (last 30 lines):",
         "─" * 60,
         log_tail.strip(),
         "─" * 60,
-        "",
-        "Read the log above directly to judge progress.",
-        "Look for epoch numbers, metric values (PMAE, loss, accuracy, etc.), errors, and trends.",
-        "Compare current metrics against the TRAINING GOAL to determine if the goal is reachable.",
-        "First line: CONTINUE, DONE, or KILL: <reason>",
     ])
 
 
@@ -3721,11 +3864,15 @@ def _cleanup_bg(bg: dict) -> None:
 
 
 def _parse_monitor_decision(text: str) -> tuple[str, str]:
-    """CONTINUE/DONE/KILL 파싱 — 대시·공백 구분자도 허용."""
+    """CONTINUE/ALERT 파싱 — 대시·공백 구분자도 허용."""
     first_line = text.strip().split('\n')[0].strip()
-    for kw in ('DONE', 'KILL', 'CONTINUE'):
+    for kw in ('ALERT', 'CONTINUE'):
         if first_line.upper().startswith(kw):
             rest = first_line[len(kw):].lstrip(' :—–-').strip()
+            # ALERT: include full message as context for evaluator
+            if kw == 'ALERT':
+                full_rest = text.strip()[len(first_line):].strip()
+                return kw, (rest + ('\n' + full_rest if full_rest else ''))
             return kw, rest
     return 'CONTINUE', f"(parse failed) {text[:200]}"
 
@@ -3770,8 +3917,8 @@ def _run_monitor_loop(bg: dict, goal: str, workdir: str, eval_model: str | None,
 
         refresh("evaluator", iteration)
         eval_msg, _ = run_evaluator(monitor_prompt, workdir, eval_model,
-                                    system_prompt=MONITOR_EVALUATOR_SYSTEM)
-        decision, feedback = _parse_monitor_decision(eval_msg)
+                                    system_prompt=EVALUATOR_SYSTEM)
+        decision, feedback = parse_decision(eval_msg)
         decision = decision.upper()
 
         eval_history.append({
@@ -3791,19 +3938,21 @@ def _run_monitor_loop(bg: dict, goal: str, workdir: str, eval_model: str | None,
         if decision == "DONE":
             _cleanup_bg(bg)
             return "DONE"
-        elif decision == "KILL":
-            try:
-                if hasattr(os, 'killpg'):
-                    os.killpg(os.getpgid(pid), _signal.SIGKILL)
-                else:
-                    os.kill(pid, _signal.SIGTERM)
-                if proc:
-                    proc.wait()
-            except (ProcessLookupError, OSError):
-                pass
+        elif decision in ("REDIRECT", "IMPROVE"):
+            # 평가자가 중단 판정 — 프로세스가 살아있으면 종료
+            if _is_proc_alive(pid, proc):
+                try:
+                    if hasattr(os, 'killpg'):
+                        os.killpg(os.getpgid(pid), _signal.SIGKILL)
+                    else:
+                        os.kill(pid, _signal.SIGTERM)
+                    if proc:
+                        proc.wait()
+                except (ProcessLookupError, OSError):
+                    pass
             _cleanup_bg(bg)
             return f"KILL:{feedback}"
-        else:  # CONTINUE or anything else
+        else:  # CONTINUE
             if proc_exited or not _is_proc_alive(pid, proc):
                 _cleanup_bg(bg)
                 return "natural_exit"
@@ -3820,9 +3969,11 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                    mode: str = "code",
                    eval_every: int = 1,
                    train_poll_seconds: int = 300,
-                   session_context: list | None = None) -> str:
+                   session_context: list | None = None,
+                   always_ab: bool = False) -> str:
     """
     Worker + Evaluator 반복 루프.
+    always_ab=True: one_dual 모드 — 매 iteration A/B 실험, 승자가 다음 base.
     반환: 'done' | 'max' | 'interrupted'
     """
     global _last_session
@@ -3904,22 +4055,27 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
         cp_before = _cp_save(workdir)
 
         # ── 정체 감지 → A/B 전략 분기 ───────────────────────────────────
-        if ab_cooldown > 0:
-            ab_cooldown -= 1
-        stagnated = ab_cooldown == 0 and _detect_stagnation(history)
+        if not always_ab:
+            if ab_cooldown > 0:
+                ab_cooldown -= 1
+        stagnated = always_ab or (ab_cooldown == 0 and _detect_stagnation(history))
         ab_chosen = None
 
         if stagnated:
-            worker_buf.append(
-                f"[yellow bold]🔀 정체 감지 ({STAGNATION_THRESHOLD}회 연속) "
-                f"— 전략 A/B 분기 시작[/yellow bold]"
-            )
+            if always_ab:
+                worker_buf.append("[cyan bold]🔀 A/B 코드 제안 시작 (one_dual)[/cyan bold]")
+            else:
+                worker_buf.append(
+                    f"[yellow bold]🔀 정체 감지 ({STAGNATION_THRESHOLD}회 연속) "
+                    f"— 전략 A/B 분기 시작[/yellow bold]"
+                )
             refresh("worker", iteration)
             ab_output, ab_chosen = _run_ab_strategy(
                 goal, history, workdir,
                 worker_model, worker_sys, active_tools,
                 eval_model, past_attempts,
                 worker_buf, iteration, refresh,
+                code_only=always_ab,
             )
             if ab_chosen == "interrupted":
                 live.stop()
@@ -3927,8 +4083,79 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                                  "eval_history": eval_history, "workdir": workdir}
                 _persist_session(_last_session)
                 return _finish('interrupted')
-            last_msg = ab_output
-            ab_cooldown = STAGNATION_THRESHOLD  # A/B 직후 N회는 재발동 억제
+            if not always_ab:
+                ab_cooldown = STAGNATION_THRESHOLD  # A/B 직후 N회는 재발동 억제
+
+            if always_ab and ab_chosen not in ("interrupted", "no_pick"):
+                # one_dual: 평가자가 코드 선택 완료 → 승자 코드로 학습 실행
+                worker_buf.append(
+                    f"[cyan bold]── 전략 {ab_chosen} 채택 → 학습 실행 시작 ──[/cyan bold]"
+                )
+                refresh("worker", iteration)
+                train_prompt = (
+                    build_worker_prompt(goal, history, past_attempts=past_attempts,
+                                        session_context=session_context)
+                    + f"\n\n[ONE_DUAL] 전략 {ab_chosen}의 코드가 workdir에 적용되었습니다. "
+                      "학습 스크립트를 background에서 실행하고 PID와 로그 경로를 보고하라. "
+                      "코드를 추가로 수정하지 마라."
+                )
+                train_result: list = [None]
+
+                def _train_worker():
+                    train_result[0], _ = run_worker(
+                        train_prompt, workdir, worker_model, worker_buf, worker_status,
+                        system_prompt=worker_sys, tools=active_tools)
+
+                t_train = threading.Thread(target=_train_worker, daemon=True)
+                t_train.start()
+                while t_train.is_alive():
+                    if _interrupt_event.is_set():
+                        break
+                    refresh("worker", iteration)
+                    time.sleep(0.1)
+                t_train.join(timeout=10)
+                refresh("worker", iteration)
+
+                if _interrupt_event.is_set():
+                    live.stop()
+                    _last_session = {"goal": goal, "history": history,
+                                     "eval_history": eval_history, "workdir": workdir}
+                    _persist_session(_last_session)
+                    return _finish('interrupted')
+
+                last_msg = train_result[0] or ab_output
+            elif ab_chosen == "no_pick":
+                # 최대 재시도 초과 → 일반 워커로 fallback (아래 else 블록과 동일 로직)
+                ab_chosen = None
+                worker_prompt = build_worker_prompt(goal, history, past_attempts=past_attempts,
+                                                    session_context=session_context)
+                worker_result = [None, None]
+
+                def _worker_np():
+                    worker_result[0], worker_result[1] = run_worker(
+                        worker_prompt, workdir, worker_model, worker_buf, worker_status,
+                        system_prompt=worker_sys, tools=active_tools)
+
+                t_np = threading.Thread(target=_worker_np, daemon=True)
+                t_np.start()
+                while t_np.is_alive():
+                    if _interrupt_event.is_set():
+                        break
+                    refresh("worker", iteration)
+                    time.sleep(0.1)
+                t_np.join(timeout=10)
+                refresh("worker", iteration)
+
+                if _interrupt_event.is_set():
+                    live.stop()
+                    _last_session = {"goal": goal, "history": history,
+                                     "eval_history": eval_history, "workdir": workdir}
+                    _persist_session(_last_session)
+                    return _finish('interrupted')
+
+                last_msg, _ = worker_result
+            else:
+                last_msg = ab_output
         else:
             # 일반 Worker 실행
             worker_prompt = build_worker_prompt(goal, history, past_attempts=past_attempts,
@@ -4736,6 +4963,7 @@ def _interactive_controller(args, workdir: str, max_iter: int, ui: InteractiveSh
             mode=current_mode,
             eval_every=eval_every,
             session_context=_session_summaries if _session_summaries else None,
+            always_ab=(current_mode == "one_dual"),
         )
 
     def _run_dual_goal(
@@ -4785,7 +5013,7 @@ def _interactive_controller(args, workdir: str, max_iter: int, ui: InteractiveSh
         if current_mode == "dual":
             task_a, task_b = split_goal_to_tasks(goal_text, args.eval_model)
             outcome = _run_dual_goal(goal_text, task_a, task_b)
-        else:
+        else:  # code, research, one_dual
             outcome = _run_single_goal(goal_text)
         _record_session_summary(outcome, goal_text)
         _report_outcome(outcome)
@@ -4892,17 +5120,19 @@ def _interactive_controller(args, workdir: str, max_iter: int, ui: InteractiveSh
                     continue
 
                 if cmd_name == "mode":
-                    if cmd_arg in ("code", "research", "dual", "single"):
+                    if cmd_arg in ("code", "research", "dual", "single", "one_dual"):
                         current_mode = "code" if cmd_arg == "single" else cmd_arg
                         if current_mode == "dual":
                             _prepare_dual_shell(ui, "", max_iter, "", "")
                             console.print("[dim]Dual 모드: Coordinator가 목표를 W1/W2로 분기합니다.[/dim]")
                         else:
                             _prepare_single_shell(ui, "", max_iter)
+                        if current_mode == "one_dual":
+                            console.print("[dim]One-Dual 모드: 매 iteration A/B 실험, 승자가 다음 base.[/dim]")
                         console.print(f"[cyan]모드 변경: {current_mode}[/cyan]")
                         console.print(f"[dim]명령을 입력하세요. 모드: {current_mode}[/dim]")
                     else:
-                        console.print("[red]/mode code|research|dual|single[/red]")
+                        console.print("[red]/mode code|research|dual|single|one_dual[/red]")
                     continue
 
                 if cmd_name == "eval-every":
@@ -5117,9 +5347,9 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["code", "research"],
+        choices=["code", "research", "dual", "one_dual"],
         default="code",
-        help="실행 모드: code(기본) / research(웹 검색·분석)",
+        help="실행 모드: code(기본) / research(웹 검색·분석) / dual(W1+W2) / one_dual(매 iter A/B)",
     )
     parser.add_argument(
         "--eval-every",
