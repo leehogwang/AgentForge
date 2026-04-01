@@ -60,6 +60,7 @@ import json
 import os
 import queue
 import re
+import tempfile
 import textwrap
 import threading
 import time
@@ -73,6 +74,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
+from rich.markup import escape as _escape_markup
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
@@ -295,7 +297,159 @@ def _mcp_call(tool_name: str, args: dict) -> str | None:
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-CODEX_BIN = Path.home() / ".npm-global" / "bin" / "codex"
+def _default_codex_hint_path() -> Path:
+    if os.name == "nt":
+        return Path.home() / "AppData" / "Roaming" / "npm" / "codex.cmd"
+    return Path.home() / ".npm-global" / "bin" / "codex"
+
+
+_CODEX_BIN_HINT = _default_codex_hint_path()
+_CODEX_BIN_CACHE: Path | None = None
+_BWRAP_ARGV0_SUPPORTED: bool | None = None
+
+
+def _npm_global_bin_dir() -> Path | None:
+    npm_candidates = ["npm.cmd", "npm"] if os.name == "nt" else ["npm"]
+    for npm_bin in npm_candidates:
+        try:
+            result = subprocess.run(
+                [npm_bin, "prefix", "-g"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            continue
+        if result.returncode != 0:
+            continue
+        prefix = (result.stdout or "").strip().splitlines()
+        if not prefix:
+            continue
+        base = Path(prefix[-1].strip()).expanduser()
+        return base if os.name == "nt" else (base / "bin")
+    return None
+
+
+def _iter_codex_candidates():
+    seen: set[str] = set()
+
+    def _yield(pathlike) -> None:
+        if not pathlike:
+            return
+        try:
+            path = Path(pathlike).expanduser()
+        except Exception:
+            return
+        key = str(path)
+        if key in seen:
+            return
+        seen.add(key)
+        yield path
+
+    env_path = os.environ.get("CODEX_BIN")
+    if env_path:
+        yield from _yield(env_path)
+
+    finder = "where" if os.name == "nt" else "which"
+    names = ["codex.cmd", "codex.exe", "codex"] if os.name == "nt" else ["codex"]
+    for name in names:
+        try:
+            result = subprocess.run(
+                [finder, name],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+        except Exception:
+            continue
+        if result.returncode != 0:
+            continue
+        for line in (result.stdout or "").splitlines():
+            yield from _yield(line.strip())
+
+    npm_bin_dir = _npm_global_bin_dir()
+    if npm_bin_dir is not None:
+        for name in names:
+            yield from _yield(npm_bin_dir / name)
+
+    home = Path.home()
+    if os.name == "nt":
+        for candidate in (
+            home / "AppData" / "Roaming" / "npm" / "codex.cmd",
+            home / "AppData" / "Roaming" / "npm" / "codex.exe",
+            home / ".npm-global" / "bin" / "codex.cmd",
+            home / ".npm-global" / "bin" / "codex",
+        ):
+            yield from _yield(candidate)
+    else:
+        for candidate in (
+            home / ".npm-global" / "bin" / "codex",
+            home / ".local" / "bin" / "codex",
+        ):
+            yield from _yield(candidate)
+
+
+def _refresh_codex_bin() -> Path | None:
+    global _CODEX_BIN_CACHE
+    for candidate in _iter_codex_candidates():
+        try:
+            if candidate.exists():
+                _CODEX_BIN_CACHE = candidate
+                return candidate
+        except OSError:
+            continue
+    _CODEX_BIN_CACHE = None
+    return None
+
+
+def _get_codex_bin() -> Path | None:
+    global _CODEX_BIN_CACHE
+    if _CODEX_BIN_CACHE is not None:
+        try:
+            if _CODEX_BIN_CACHE.exists():
+                return _CODEX_BIN_CACHE
+        except OSError:
+            pass
+    return _refresh_codex_bin()
+
+
+def _codex_display_path() -> str:
+    return str(_get_codex_bin() or _CODEX_BIN_HINT)
+
+
+def _supports_bwrap_argv0() -> bool:
+    global _BWRAP_ARGV0_SUPPORTED
+    if _BWRAP_ARGV0_SUPPORTED is not None:
+        return _BWRAP_ARGV0_SUPPORTED
+    if os.name == "nt":
+        _BWRAP_ARGV0_SUPPORTED = True
+        return True
+    try:
+        result = subprocess.run(
+            ["bwrap", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        help_text = f"{result.stdout or ''}\n{result.stderr or ''}"
+        _BWRAP_ARGV0_SUPPORTED = "--argv0" in help_text
+    except Exception:
+        _BWRAP_ARGV0_SUPPORTED = False
+    return _BWRAP_ARGV0_SUPPORTED
+
+
+def _codex_exec_sandbox_args(sandbox: str) -> list[str]:
+    if sandbox == "danger-full-access":
+        return ["--dangerously-bypass-approvals-and-sandbox"]
+    if sandbox in {"workspace-write", "read-only"}:
+        if _supports_bwrap_argv0():
+            return ["--sandbox", sandbox]
+        # Older bubblewrap releases reject --argv0, which breaks every shell
+        # command inside codex exec. Fall back to the unsandboxed mode that
+        # matches AgentForge's legacy local-shell behavior.
+        return ["--dangerously-bypass-approvals-and-sandbox"]
+    return []
+
 KNOWLEDGE_DIR  = Path.home() / ".agentforge" / "knowledge"   # 영구 지식 저장소 루트
 SESSION_ROOT   = Path.home() / ".agentforge" / "sessions"
 LEGACY_SESSION_FILE = Path.home() / ".agentforge" / "last_session.json"
@@ -315,6 +469,9 @@ _pending_bg_job: "dict | None" = None
 _pending_bg_job_lock = threading.Lock()
 NOISE_RE = re.compile(r'^\s*([\-─═\s]+)?$')
 STAGNATION_THRESHOLD = 3   # N회 연속 정체 시 A/B 전략 발동
+NO_EVIDENCE_REDIRECT_THRESHOLD = 2
+REPEATED_FEEDBACK_REDIRECT_THRESHOLD = 3
+AUTH_PARSE_REDIRECT_THRESHOLD = 2
 _AB_PICK_RE  = re.compile(r'PICK:([AB])', re.I)
 _AB_RETRY_RE = re.compile(r'\bRETRY\b', re.I)
 _TASK_RE     = re.compile(r'^TASK_([AB]):\s*(.+?)$', re.I | re.M)
@@ -323,9 +480,50 @@ _GPU_RE      = re.compile(
     r'|--gpu(?:s)?\s+(\d+)'
     r'|--device\s+cuda:(\d+)', re.I)
 _GPU_PICK_RE = re.compile(r'^GPU_PICK(?::\s*(.*))?$', re.I | re.M)
+_AUTH_SUCCESS_RE = re.compile(
+    r'(?:\blog(?:ged)?\s*in\b|\blogin\s+(?:successful|success|complete(?:d)?)\b|'
+    r'\bauth(?:entication)?\s+(?:successful|success|complete(?:d)?)\b|'
+    r'로그인\s*(?:성공|완료)|인증\s*(?:성공|완료))',
+    re.I,
+)
+_TASK_PARSE_FAILURE_RE = re.compile(
+    r'(?:\bparse(?:d|r|rs|s)?\s+(?:fail(?:ed|ure)?|error)\b|'
+    r'\b(?:failed|unable|could not|cannot)\s+to\s+parse\b|'
+    r'\btask\s+parse\s+fail(?:ed|ure)?\b|'
+    r'\bextract(?:ion)?\s+fail(?:ed|ure)?\b|'
+    r'파싱\s*실패|구문\s*분석\s*실패|과제\s*파싱\s*실패|실과제\s*파싱\s*실패)',
+    re.I,
+)
 _ACTIVE_GPU: dict[int, int | None] = {1: None, 2: None}  # worker_id → gpu_id
 _ACTIVE_GPU_LOCK = threading.Lock()
 _GPU_CONFLICT_THRESH = 0.85
+_FAST_MODE = False
+_FAST_MODE_LOCK = threading.Lock()
+
+
+def _set_fast_mode(enabled: bool) -> None:
+    global _FAST_MODE
+    with _FAST_MODE_LOCK:
+        _FAST_MODE = bool(enabled)
+
+
+def _fast_mode_requested() -> bool:
+    with _FAST_MODE_LOCK:
+        return _FAST_MODE
+
+
+def _fast_mode_active() -> bool:
+    return _fast_mode_requested() and _get_codex_bin() is not None
+
+
+def _force_disable_fast_mode(reason: str | None = None) -> None:
+    _set_fast_mode(False)
+    if _ACTIVE_UI is not None:
+        _ACTIVE_UI.set_fast_mode(False)
+    try:
+        _append_session_event("fast_mode", enabled=False, reason=reason or "runtime_fallback")
+    except Exception:
+        pass
 
 def _capture_rich_text(*objects, width: int | None = None,
                        height: int | None = None, **print_kwargs) -> str:
@@ -390,6 +588,10 @@ def _current_ui_state_file() -> Path:
 
 def _current_event_log_file() -> Path:
     return _SESSION_CTX.event_log_file if _SESSION_CTX is not None else (LEGACY_SESSION_FILE.parent / "events.jsonl")
+
+
+def _current_session_workdir() -> str:
+    return _SESSION_CTX.workdir if _SESSION_CTX is not None else os.getcwd()
 
 
 class _ShellLayoutSlot:
@@ -649,6 +851,7 @@ def _persist_session(session: dict) -> None:
             data['history'] = _slim(session.get('history', []))
         data['saved_at'] = time.strftime("%Y-%m-%dT%H:%M:%S")
         data['session_key'] = _SESSION_CTX.key if _SESSION_CTX is not None else "legacy"
+        data['fast_mode'] = _fast_mode_requested()
         _write_json_atomic(_current_session_file(), data)
     except Exception:
         pass
@@ -908,6 +1111,325 @@ def _iter_events(payload: dict):
         yield {"type": "_error", "message": str(e)}
 
 
+def _compose_codex_exec_prompt(system_prompt: str | None, prompt: str) -> str:
+    if not system_prompt:
+        return prompt
+    return (
+        "SYSTEM INSTRUCTIONS (higher priority):\n"
+        f"{system_prompt.strip()}\n\n"
+        "USER TASK:\n"
+        f"{prompt}"
+    )
+
+
+def _terminate_child_process(proc: subprocess.Popen | None) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, _signal.SIGTERM)
+        else:
+            proc.terminate()
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, _signal.SIGKILL)
+            else:
+                proc.kill()
+        except Exception:
+            pass
+
+
+_FAST_EVALUATOR_DECISIONS = ("CONTINUE", "IMPROVE", "REDIRECT", "DONE", "GPU_PICK", "KILL")
+_EVALUATOR_DECISION_ALIASES = {
+    "APPROVE": "DONE",
+    "APPROVED": "DONE",
+    "COMPLETE": "DONE",
+    "COMPLETED": "DONE",
+    "ACCEPT": "DONE",
+    "ACCEPTED": "DONE",
+    "CHANGES_REQUESTED": "IMPROVE",
+    "CHANGE_REQUESTED": "IMPROVE",
+    "REJECT": "REDIRECT",
+    "REJECTED": "REDIRECT",
+}
+_FAST_EVALUATOR_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "decision",
+        "reason_type",
+        "next_action",
+        "confidence",
+        "rollback_needed",
+        "needs_search",
+        "needs_long_run_monitor",
+        "summary",
+    ],
+    "properties": {
+        "decision": {"type": "string", "enum": list(_FAST_EVALUATOR_DECISIONS)},
+        "reason_type": {"type": "string"},
+        "next_action": {"type": "string"},
+        "confidence": {"type": "number"},
+        "rollback_needed": {"type": "boolean"},
+        "needs_search": {"type": "boolean"},
+        "needs_long_run_monitor": {"type": "boolean"},
+        "summary": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["judgment", "result_paths", "result_summary"],
+            "properties": {
+                "judgment": {"type": "string"},
+                "result_paths": {"type": "array", "items": {"type": "string"}},
+                "result_summary": {"type": "string"},
+            },
+        },
+    },
+}
+
+
+def _canonicalize_evaluator_decision(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    upper = text.upper().replace("-", "_").replace(" ", "_")
+    return _EVALUATOR_DECISION_ALIASES.get(upper, upper)
+
+
+def _fast_evaluator_response_invalid(text: str) -> bool:
+    raw = _extract_json_object(text)
+    if not isinstance(raw, dict):
+        return True
+    decision = _canonicalize_evaluator_decision(raw.get("decision", ""))
+    if decision not in _FAST_EVALUATOR_DECISIONS:
+        return True
+    summary = raw.get("summary")
+    if summary is None:
+        return True
+    return not isinstance(summary, (dict, str))
+
+
+def _build_codex_exec_command(
+    prompt: str,
+    workdir: str,
+    model: str,
+    *,
+    system_prompt: str | None = None,
+    search: bool = False,
+    sandbox: str = "workspace-write",
+    output_schema_path: str | None = None,
+) -> tuple[list[str], str]:
+    combined_prompt = _compose_codex_exec_prompt(system_prompt, prompt)
+    cmd = [str(_get_codex_bin() or _CODEX_BIN_HINT)]
+    if search:
+        cmd.append("--search")
+    cmd += [
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--cd",
+        workdir,
+        "--color",
+        "never",
+        "-m",
+        model,
+    ]
+    cmd += _codex_exec_sandbox_args(sandbox)
+    if output_schema_path:
+        cmd += ["--output-schema", output_schema_path]
+    cmd += ["-c", 'service_tier="fast"', "-c", "features.fast_mode=true", "-"]
+    return cmd, combined_prompt
+
+
+def _iter_codex_exec_events(
+    prompt: str,
+    workdir: str,
+    model: str,
+    *,
+    system_prompt: str | None = None,
+    search: bool = False,
+    sandbox: str = "workspace-write",
+    output_schema: dict | None = None,
+):
+    codex_bin = _get_codex_bin()
+    if codex_bin is None:
+        yield {"type": "_error", "message": f"codex not found at {_codex_display_path()}"}
+        return
+
+    schema_path: str | None = None
+    if output_schema is not None:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as schema_file:
+            json.dump(output_schema, schema_file, ensure_ascii=False)
+            schema_path = schema_file.name
+
+    cmd, combined_prompt = _build_codex_exec_command(
+        prompt,
+        workdir,
+        model,
+        system_prompt=system_prompt,
+        search=search,
+        sandbox=sandbox,
+        output_schema_path=schema_path,
+    )
+    proc: subprocess.Popen | None = None
+    event_q: queue.Queue = queue.Queue()
+    stderr_lines: list[str] = []
+    stdout_done = False
+    stderr_done = False
+
+    def _pump_stream(kind: str, stream) -> None:
+        try:
+            for raw in stream:
+                event_q.put((kind, raw))
+        finally:
+            event_q.put((f"{kind}_done", None))
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=workdir,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        with _active_procs_lock:
+            _active_procs.add(proc)
+
+        stdout_thread = threading.Thread(
+            target=_pump_stream, args=("stdout", proc.stdout), daemon=True
+        )
+        stderr_thread = threading.Thread(
+            target=_pump_stream, args=("stderr", proc.stderr), daemon=True
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+        if proc.stdin is not None:
+            proc.stdin.write(combined_prompt)
+            if not combined_prompt.endswith("\n"):
+                proc.stdin.write("\n")
+            proc.stdin.close()
+
+        while True:
+            if _interrupt_event.is_set():
+                _terminate_child_process(proc)
+            if stdout_done and proc.poll() is not None:
+                break
+            try:
+                kind, raw = event_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if kind == "stdout":
+                line = (raw or "").strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except Exception:
+                    stderr_lines.append(f"stdout(non-json): {line}")
+            elif kind == "stderr":
+                line = (raw or "").strip()
+                if line:
+                    stderr_lines.append(line)
+            elif kind == "stdout_done":
+                stdout_done = True
+            elif kind == "stderr_done":
+                stderr_done = True
+
+        try:
+            returncode = proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _terminate_child_process(proc)
+            returncode = proc.returncode or 1
+
+        if returncode != 0 and not _interrupt_event.is_set():
+            detail = stderr_lines[-1] if stderr_lines else f"codex exec exited with code {returncode}"
+            yield {"type": "_error", "message": detail}
+    except Exception as e:
+        yield {"type": "_error", "message": str(e)}
+    finally:
+        if proc is not None:
+            _terminate_child_process(proc)
+            with _active_procs_lock:
+                _active_procs.discard(proc)
+        if schema_path:
+            Path(schema_path).unlink(missing_ok=True)
+        while not stderr_done:
+            try:
+                kind, raw = event_q.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "stderr":
+                line = (raw or "").strip()
+                if line:
+                    stderr_lines.append(line)
+            elif kind == "stderr_done":
+                stderr_done = True
+
+
+def _run_text_completion(
+    prompt: str,
+    workdir: str,
+    model: str,
+    *,
+    system_prompt: str | None = None,
+    search: bool = False,
+    sandbox: str = "read-only",
+    output_schema: dict | None = None,
+) -> tuple[str, int]:
+    if _fast_mode_active():
+        parts: list[str] = []
+        fast_failed = False
+        for ev in _iter_codex_exec_events(
+            prompt,
+            workdir,
+            model,
+            system_prompt=system_prompt,
+            search=search,
+            sandbox=sandbox,
+            output_schema=output_schema,
+        ):
+            if ev.get("type") == "_error":
+                reason = ev.get('message', 'unknown error')
+                _force_disable_fast_mode(reason)
+                fast_failed = True
+                _dbg("FAST", f"TEXT_FALLBACK  reason={reason}")
+                break
+            if ev.get("type") != "item.completed":
+                continue
+            item = ev.get("item") or {}
+            if item.get("type") == "agent_message":
+                text = str(item.get("text") or "").strip()
+                if text:
+                    parts.append(text)
+        if not fast_failed:
+            return "\n\n".join(parts).strip(), 0
+
+    payload = {
+        "model": model,
+        "instructions": system_prompt or "",
+        "input": [{"role": "user", "content": prompt}],
+        "store": False,
+        "stream": True,
+    }
+    parts: list[str] = []
+    gen = _iter_events(payload)
+    try:
+        for ev in gen:
+            if ev.get("type") == "_error":
+                return f"[Backend error] {ev.get('message', 'unknown error')}", 1
+            if ev.get("type") == "response.output_text.delta":
+                parts.append(ev.get("delta", ""))
+    finally:
+        gen.close()
+    return "".join(parts).strip(), 0
+
+
 # ── DEBUG LOGGING ─────────────────────────────────────────────────────────────
 # 제거 방법: 이 블록(# ── DEBUG LOGGING ── 부터 # ── END DEBUG LOGGING ──까지) 삭제
 import datetime as _dt
@@ -944,6 +1466,7 @@ def _execute_tool(name: str, args: dict, workdir: str, worker_id: int = 0) -> st
         if name == "shell":
             timeout = min(int(args.get("timeout_seconds", 120)), 7200)
             _env = os.environ.copy()
+            _env.setdefault('CUDA_VISIBLE_DEVICES', '2')
             if _WANDB_API_KEY:
                 _env.setdefault('WANDB_API_KEY', _WANDB_API_KEY)
                 _env.setdefault('WANDB_PROJECT', Path(workdir).name)
@@ -1066,6 +1589,7 @@ def _execute_tool(name: str, args: dict, workdir: str, worker_id: int = 0) -> st
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_fd = open(log_path, "w", buffering=1)
             _bg_env = os.environ.copy()
+            _bg_env.setdefault('CUDA_VISIBLE_DEVICES', '2')
             if _WANDB_API_KEY:
                 _bg_env.setdefault('WANDB_API_KEY', _WANDB_API_KEY)
                 _bg_env.setdefault('WANDB_PROJECT', Path(workdir).name)
@@ -1200,6 +1724,9 @@ def _execute_tool(name: str, args: dict, workdir: str, worker_id: int = 0) -> st
 SLASH_COMMANDS = [
     ("/resume",          "마지막 세션 재개"),
     ("/exit",            "종료"),
+    ("/fast on",         "공식 Codex fast transport 사용"),
+    ("/fast off",        "기본 backend transport로 복귀"),
+    ("/fast status",     "현재 fast transport 상태 확인"),
     ("/mode code",       "코딩 모드로 전환"),
     ("/mode research",   "연구 모드로 전환"),
     ("/mode dual",       "Dual-Worker 모드 (Coordinator → W1+W2 병렬)"),
@@ -1289,6 +1816,7 @@ class InteractiveShellUI:
         self.app_name = app_name
         self._lock = threading.RLock()
         self._panel_mode = restored.get("panel_mode", "single")
+        self._fast_mode = bool(restored.get("fast_mode", False))
         self._renderables: dict[str, object] = {}
         self._render_version = 0
         self._top_cache_key: tuple | None = None
@@ -1507,6 +2035,16 @@ class InteractiveShellUI:
         self._refresh_composer_title()
         self._persist_ui_state()
 
+    @property
+    def fast_mode(self) -> bool:
+        return self._fast_mode
+
+    def set_fast_mode(self, enabled: bool) -> None:
+        self._fast_mode = bool(enabled)
+        self._refresh_composer_title()
+        self._persist_ui_state(force=True)
+        self.invalidate()
+
     def add_notice(self, text: str) -> None:
         if not text:
             return
@@ -1658,10 +2196,11 @@ class InteractiveShellUI:
 
     def _refresh_composer_title(self) -> None:
         state = "RUNNING" if self._busy else "READY"
+        transport = "FAST" if self._fast_mode else "STD"
         hint = "Enter send  Esc+Enter newline  / for commands  -r reconnect"
         self._set_control_text(
             self._composer_title_control,
-            f"\x1b[38;2;142;162;192m {self.app_name.upper()}  {state} \x1b[0m"
+            f"\x1b[38;2;142;162;192m {self.app_name.upper()}  {state}  {transport} \x1b[0m"
             f"\x1b[38;2;120;128;140m  {hint}\x1b[0m"
         )
 
@@ -1679,6 +2218,7 @@ class InteractiveShellUI:
                 "draft_cursor": self.input_field.buffer.cursor_position,
                 "composer_prompt": self._composer_prompt,
                 "busy": self._busy,
+                "fast_mode": self._fast_mode,
             }
         _persist_ui_state(state)
 
@@ -1747,6 +2287,26 @@ def strip_ansi(text: str) -> str:
     return ANSI_RE.sub('', text)
 
 
+_WORKER_LINE_PREFIX_RE = re.compile(r'^\[[A-Z0-9]{1,4}\]\s+')
+
+
+def _normalize_worker_status_line(line: str) -> str:
+    text = strip_ansi(str(line or "")).strip()
+    text = _WORKER_LINE_PREFIX_RE.sub('', text)
+    if not text or NOISE_RE.match(text):
+        return ""
+    if text.startswith("```"):
+        return ""
+    return re.sub(r"\s+", " ", text)
+
+
+def _trim_ui_text(text: str, width: int) -> str:
+    text = str(text or "").strip()
+    if len(text) <= width:
+        return text
+    return text[: max(1, width - 1)] + "…"
+
+
 def safe_input(prompt: str = "", default: str = "") -> str:
     if _ACTIVE_UI is not None:
         return _ACTIVE_UI.read_input(prompt=prompt, default=default)
@@ -1768,11 +2328,17 @@ WORKER_SYSTEM = textwrap.dedent("""\
     Make concrete, real code changes — do not just describe what to do.
     Be thorough and complete.
 
-    To achieve the user's goal, actively leverage internet resources — research papers,
-    GitHub repositories, technical blog posts, and documentation. Do not rely solely on
-    your existing knowledge; search for the latest techniques and implementations first.
+    To achieve the user's goal, leverage internet resources — research papers,
+    GitHub repositories, technical blog posts, and documentation — when genuinely needed.
+    Only search the web if your existing knowledge is insufficient for the current step.
 
     Start your response with: HYPOTHESIS: <one sentence — what approach you're taking and why>
+
+    AUTONOMY CONTRACT:
+    - Once execution has started, do not pause to ask the user whether to continue.
+    - Keep iterating until you hit a real blocker, a hard failure, or the evaluator returns DONE.
+    - If one attempt fails, record why, revert if needed, and immediately try the next sensible attempt.
+    - Do not stop at analysis when a concrete code change, command, or experiment is possible.
 
     GENERALIZATION RULES (strictly enforced — the evaluator will reject violations):
     - Fix the ROOT CAUSE, not the symptom. Before writing any fix, ask: "why does this
@@ -1784,6 +2350,11 @@ WORKER_SYSTEM = textwrap.dedent("""\
       not just the observed example or test case in the goal.
     - Before writing code, state the general contract: "this function must satisfy X for
       all Y" — then implement that contract.
+
+    BASELINE RULE:
+    - If the task is measurable, establish a baseline before claiming optimization.
+    - Do not claim improvement without comparing against a prior accepted attempt, metric, or test result.
+    - Record what changed, how it was measured, and whether the result improved or regressed.
 
     If the task involves training ML models or data analysis:
     - WANDB_API_KEY is pre-configured; call wandb.init() freely (WANDB_PROJECT = workdir name)
@@ -1841,6 +2412,12 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
       written or trained yet — respond with CONTINUE (not REDIRECT or IMPROVE).
     - "No code yet" is NOT hardcoding. Do not penalise exploration.
 
+    EVIDENCE HIERARCHY:
+    - Prefer objective evidence over persuasive prose.
+    - If the task has a measurable success signal, judge primarily from metrics, tests, or evaluation output.
+    - If validating evidence is missing, do not return DONE.
+    - A confident explanation without verification is not completion.
+
     HARDCODING DETECTION (only when actual code or trained output exists):
     - Actively scan the worker's code for: hardcoded magic values, special-cased
       conditions like `if x == <specific_value>`, lookup tables that memorize
@@ -1869,6 +2446,11 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
     ⚠ STAGNATION RULE: If CURRENT ITERATION is high (≥ 15) and the core issue in
     your feedback is the same as what you've said before, you MUST issue REDIRECT
     (not IMPROVE). Repeating the same IMPROVE is not helpful — force a strategy change.
+
+    SIMPLICITY RULE:
+    - Prefer simpler solutions when correctness is equal.
+    - Small gains that add brittle complexity should usually not be kept.
+    - Code deletion or simplification with equal results is a positive outcome.
 
     When responding with DONE, after the keyword write a Korean summary in this EXACT format:
 
@@ -1971,6 +2553,24 @@ def _knowledge_path(goal: str) -> Path:
     return p
 
 
+def _memory_events_path(goal: str) -> Path:
+    return _knowledge_path(goal) / "events.jsonl"
+
+
+def _append_memory_event(goal: str, event: dict) -> None:
+    try:
+        payload = {
+            "event_type": event.get("event_type", "generic"),
+            "timestamp": event.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "goal": goal,
+            **{k: v for k, v in event.items() if k not in {"event_type", "timestamp", "goal"}},
+        }
+        with open(_memory_events_path(goal), "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def _save_attempt(goal: str, record: dict) -> None:
     """시도 기록을 JSONL에 append (스레드 안전: Linux append는 원자적)."""
     try:
@@ -1978,6 +2578,10 @@ def _save_attempt(goal: str, record: dict) -> None:
         line = json.dumps(record, ensure_ascii=False) + "\n"
         with open(path, "a", encoding="utf-8") as f:
             f.write(line)
+        _append_memory_event(goal, {
+            "event_type": "attempt_summary",
+            **record,
+        })
     except Exception:
         pass  # 저장 실패해도 에이전트 동작에 영향 없도록
 
@@ -2106,18 +2710,54 @@ def _find_similar_goals(goal: str, threshold: float = 0.6) -> list[Path]:
 def _load_attempts_from_dir(d: Path) -> list[dict]:
     """디렉토리에서 attempts.jsonl 로드."""
     try:
-        path = d / "attempts.jsonl"
-        if not path.exists():
-            return []
         records = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line:
+        events_path = d / "events.jsonl"
+        if events_path.exists():
+            for line in events_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
                 try:
-                    records.append(json.loads(line))
+                    item = json.loads(line)
+                    if isinstance(item, dict):
+                        item.setdefault("event_type", "generic")
+                        records.append(item)
                 except Exception:
                     pass
-        return records
+
+        legacy_path = d / "attempts.jsonl"
+        if legacy_path.exists():
+            for line in legacy_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                item.setdefault("event_type", "attempt_summary")
+                records.append(item)
+
+        records.sort(key=lambda item: str(item.get("timestamp", "")))
+        deduped = []
+        seen = set()
+        for item in records:
+            key = (
+                item.get("event_type"),
+                item.get("timestamp"),
+                item.get("iter"),
+                item.get("tool_name"),
+                item.get("path"),
+                item.get("decision"),
+                item.get("worker_summary"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
     except Exception:
         return []
 
@@ -2160,7 +2800,31 @@ def _retrieve_relevant(query: str, attempts: list[dict], top_k: int = 6) -> list
         return []
 
     def _text(a: dict) -> str:
-        return f"{a.get('feedback','')} {a.get('worker_summary','')} {a.get('decision','')}"
+        event_type = a.get("event_type", "generic")
+        parts = [
+            event_type,
+            a.get("decision", ""),
+            a.get("reason_type", ""),
+            a.get("feedback", ""),
+            a.get("next_action", ""),
+            a.get("worker_summary", ""),
+            a.get("hypothesis", ""),
+            a.get("tool_name", ""),
+            a.get("command", ""),
+            a.get("path", ""),
+            a.get("artifact_path", ""),
+            a.get("metric_name", ""),
+            str(a.get("metric_value", "")),
+            " ".join(a.get("changed_files", []) if isinstance(a.get("changed_files"), list) else []),
+        ]
+        summary = a.get("summary")
+        if isinstance(summary, dict):
+            parts.extend([
+                summary.get("judgment", ""),
+                summary.get("result_summary", ""),
+                " ".join(summary.get("result_paths", []) if isinstance(summary.get("result_paths"), list) else []),
+            ])
+        return " ".join(str(part) for part in parts if part)
 
     try:
         from rank_bm25 import BM25Okapi
@@ -2198,20 +2862,48 @@ def _build_rag_section(past_attempts: list[dict], current_context: str) -> str:
 
     lines = [
         "━" * 60,
-        "PAST ATTEMPTS FROM PREVIOUS SESSIONS — DO NOT REPEAT THESE:",
+        "PAST MEMORY EVENTS FROM PREVIOUS SESSIONS — USE THESE TO AVOID REPEATING FAILURES:",
     ]
     for a in relevant:
+        event_type = a.get("event_type", "generic")
+        ts = str(a.get("timestamp", ""))[:10]
+        if event_type == "tool_call":
+            lines.append(
+                f"  [tool_call] ({ts}) {a.get('tool_name','?')} -> "
+                f"{a.get('result_summary','')[:160]}"
+            )
+            continue
+        if event_type == "file_change":
+            lines.append(
+                f"  [file_change] ({ts}) {a.get('path','')} "
+                f"(rolled_back={a.get('rolled_back', False)})"
+            )
+            continue
+        if event_type == "metric":
+            lines.append(
+                f"  [metric] ({ts}) {a.get('metric_name','metric')}={a.get('metric_value','')}"
+            )
+            continue
+        if event_type == "decision":
+            lines.append(
+                f"  [decision] ({ts}) {a.get('decision','?')} / {a.get('reason_type','other')}"
+            )
+            if a.get("next_action"):
+                lines.append(f"    next: {a.get('next_action','')[:180]}")
+            if a.get("worker_summary"):
+                lines.append(f"    worker: {a.get('worker_summary','')[:160]}")
+            continue
+
         decision = a.get("decision", "?")
         feedback = a.get("feedback", "")[:200]
-        summary  = a.get("worker_summary", "")[:150]
-        ts       = a.get("timestamp", "")[:10]
-        badge    = {"DONE": "✓", "IMPROVE": "▲", "REDIRECT": "↩"}.get(decision, "?")
+        summary = a.get("worker_summary", "")[:150]
+        badge = {"DONE": "✓", "IMPROVE": "▲", "REDIRECT": "↩", "CONTINUE": "→"}.get(decision, "?")
         lines.append(f"  [{badge} {decision}] ({ts}) {feedback}")
         if summary:
             lines.append(f"    tried: {summary}")
         hyp = a.get("hypothesis", "")
         if hyp:
-            lines.append(f"    hypothesis was: {hyp}")
+            lines.append(f"    hypothesis was: {hyp[:160]}")
     lines.append("━" * 60)
     return "\n".join(lines)
 
@@ -2473,6 +3165,595 @@ DUAL_EVALUATOR_SYSTEM = textwrap.dedent("""\
     Do NOT write anything before the decision keyword.
 """).strip()
 
+TASK_ML_RE = re.compile(
+    r'\b(train|training|fine[- ]?tun|epoch|dataset|model|loss|accuracy|pmae|inference|evaluation)\b',
+    re.I,
+)
+TASK_RESEARCH_RE = re.compile(
+    r'\b(research|paper|arxiv|literature|survey|web|search|benchmark|compare)\b',
+    re.I,
+)
+TASK_LONG_RUN_RE = re.compile(
+    r'\b(train|training|crawl|scrape|index|benchmark|large|batch|process|evaluate|evaluation)\b',
+    re.I,
+)
+
+WORKER_BASE_POLICY = textwrap.dedent("""\
+    You are an autonomous worker agent for software engineering and ML tasks.
+    Make concrete progress toward the goal now. Do not stop to ask for confirmation.
+    Start your answer with: HYPOTHESIS: <one sentence>.
+    End each turn with either a concrete result or a launched long-running job.
+""").strip()
+
+WORKER_AUTONOMY_POLICY = textwrap.dedent("""\
+    AUTONOMY CONTRACT:
+    - Once execution has started, do not pause to ask the user whether to continue.
+    - Keep iterating until you hit a real blocker, a hard failure, or the evaluator returns DONE.
+    - If one attempt fails, record why, revert if needed, and start the next attempt immediately.
+    - Do not stop at analysis when a concrete code change, command, or experiment is possible.
+""").strip()
+
+WORKER_GENERALIZATION_POLICY = textwrap.dedent("""\
+    GENERALIZATION RULES:
+    - Fix root causes, not only the observed symptom.
+    - Avoid hardcoded example-specific logic or magic-value patches.
+    - State the general contract implicitly in your implementation choices.
+    - Prefer reusable abstractions over one-off branching for the current example.
+""").strip()
+
+WORKER_PATH_POLICY = textwrap.dedent("""\
+    PATH RULES:
+    - Use file paths exactly as provided by the user.
+    - Do not rewrite Windows paths into Unix paths or vice versa.
+    - Pass exact path strings into tools and commands.
+""").strip()
+
+WORKER_WEB_POLICY = textwrap.dedent("""\
+    RESEARCH POLICY:
+    - When local context is insufficient, use web_search and fetch_url to gather primary references.
+    - Search purposefully. Pull only enough external context to unblock the next action.
+    - Incorporate useful findings into the implementation instead of stopping at notes.
+""").strip()
+
+WORKER_LONG_RUN_POLICY = textwrap.dedent("""\
+    LONG-RUNNING TASK POLICY:
+    - Any command likely to exceed one minute must use shell_background, not shell.
+    - shell_background must return PID and LOG path so the monitor can take over.
+    - After launching a long-running job, summarize what started and why, then end the turn.
+""").strip()
+
+WORKER_BASELINE_POLICY = textwrap.dedent("""\
+    BASELINE POLICY:
+    - If the task is measurable, establish a baseline before claiming optimization.
+    - Do not claim improvement without comparing against a prior accepted attempt, metric, or test result.
+    - Record what changed, how it was measured, and whether the result improved or regressed.
+""").strip()
+
+WORKER_ML_POLICY = textwrap.dedent("""\
+    ML POLICY:
+    - Use data_profile before modeling tabular data when appropriate.
+    - Keep training logs compact and machine-readable at epoch level.
+    - Do not leak labels, annotations, or deployment-unavailable metadata into inference inputs.
+    - Use WANDB_API_KEY if available for experiment tracking.
+""").strip()
+
+WORKER_RESEARCH_MODE_POLICY = textwrap.dedent("""\
+    RESEARCH MODE:
+    - Investigate the topic thoroughly and synthesize what matters for the goal.
+    - Read important pages with fetch_url and organize findings into files when useful.
+""").strip()
+
+EVALUATOR_BASE_POLICY = textwrap.dedent("""\
+    You are a strict evaluator agent. You never edit files.
+    Judge whether the worker is making meaningful progress toward the goal.
+    Exploration with no code changes yet may return CONTINUE instead of penalizing early.
+""").strip()
+
+EVALUATOR_EVIDENCE_POLICY = textwrap.dedent("""\
+    EVIDENCE HIERARCHY:
+    - Prefer objective evidence over persuasive prose.
+    - If the task has a measurable success signal, judge primarily from metrics, tests, or evaluation output.
+    - If validating evidence is missing, do not return DONE.
+    - A confident explanation without verification is not completion.
+""").strip()
+
+EVALUATOR_GENERALIZATION_POLICY = textwrap.dedent("""\
+    REVIEW RULES:
+    - Reject example-specific fixes and hardcoded behavior.
+    - Prefer REDIRECT when the current strategy is fundamentally wrong or repeated feedback is not resolving the issue.
+    - DONE requires the goal to be achieved correctly, not only partially demonstrated.
+""").strip()
+
+EVALUATOR_SIMPLICITY_POLICY = textwrap.dedent("""\
+    SIMPLICITY RULE:
+    - Prefer simpler solutions when correctness is equal.
+    - Small gains that add brittle complexity should usually not be kept.
+    - Code deletion or simplification with equal results is a positive outcome.
+""").strip()
+
+EVALUATOR_RESEARCH_POLICY = textwrap.dedent("""\
+    RESEARCH REVIEW:
+    - Reward targeted external research when the task requires missing technical context.
+    - If the worker ignored obviously necessary references, set needs_search=true.
+""").strip()
+
+EVALUATOR_ML_POLICY = textwrap.dedent("""\
+    ML REVIEW:
+    - Check for data contamination, deployment-unavailable inputs, and invalid evaluation setup.
+    - If training finished but evaluation metrics are still missing, do not return DONE.
+    - Use needs_long_run_monitor=true when the next sensible step is a monitored long-running run.
+""").strip()
+
+EVALUATOR_JSON_POLICY = textwrap.dedent("""\
+    Return exactly one JSON object and nothing else.
+    Required fields:
+    {
+      "decision": "CONTINUE | IMPROVE | REDIRECT | DONE",
+      "reason_type": "exploration | verification_gap | root_cause_missing | hardcoding | invalid_strategy | metrics_missing | goal_met | monitoring | no_artifact | task_parse_failure | repeated_feedback | other",
+      "next_action": "short actionable instruction for the worker",
+      "confidence": 0.0,
+      "rollback_needed": false,
+      "needs_search": false,
+      "needs_long_run_monitor": false,
+      "summary": {
+        "judgment": "Korean explanation",
+        "result_paths": ["relevant/file/path"],
+        "result_summary": "Korean one-line summary"
+      }
+    }
+    Use rollback_needed=true when current changes should be discarded before the next attempt.
+    For DONE, fill all summary fields in Korean. For non-DONE decisions, summary fields may be brief or empty.
+""").strip()
+
+MONITOR_JSON_POLICY = textwrap.dedent("""\
+    You are evaluating a monitored long-running job.
+    Return exactly one JSON object and nothing else.
+    Valid decisions here are CONTINUE, IMPROVE, REDIRECT, or DONE.
+    Set needs_long_run_monitor=true when the job should keep running.
+    If the process crashed, stalled, or is clearly on the wrong track, return REDIRECT.
+""").strip()
+
+
+def _latest_eval_meta(history: list | None) -> dict:
+    if not history:
+        return {}
+    for item in reversed(history):
+        if item.get("type") == "compressed_summary":
+            continue
+        meta = item.get("eval_meta")
+        if isinstance(meta, dict):
+            return meta
+    return {}
+
+
+def _detect_task_profile(goal: str, mode: str = "code", history: list | None = None) -> dict:
+    goal_text = goal or ""
+    combined = goal_text.lower()
+    last_meta = _latest_eval_meta(history)
+
+    is_research = mode == "research"
+    is_ml = bool(TASK_ML_RE.search(combined))
+    needs_search = is_research or bool(TASK_RESEARCH_RE.search(combined)) or bool(last_meta.get("needs_search"))
+    needs_long_run = bool(TASK_LONG_RUN_RE.search(combined)) or is_ml or bool(last_meta.get("needs_long_run_monitor"))
+
+    labels = ["base", "generalization", "paths"]
+    if needs_search:
+        labels.append("search")
+    if needs_long_run:
+        labels.append("long_run")
+    if is_ml:
+        labels.append("ml")
+    if is_research:
+        labels.append("research_mode")
+
+    return {
+        "mode": mode,
+        "is_ml": is_ml,
+        "needs_search": needs_search,
+        "needs_long_run_monitor": needs_long_run,
+        "labels": labels,
+    }
+
+
+def _compose_worker_system(profile: dict) -> str:
+    sections = [
+        WORKER_BASE_POLICY,
+        WORKER_AUTONOMY_POLICY,
+        WORKER_GENERALIZATION_POLICY,
+        WORKER_PATH_POLICY,
+        WORKER_BASELINE_POLICY,
+    ]
+    if profile.get("needs_search"):
+        sections.append(WORKER_WEB_POLICY)
+    if profile.get("needs_long_run_monitor"):
+        sections.append(WORKER_LONG_RUN_POLICY)
+    if profile.get("is_ml"):
+        sections.append(WORKER_ML_POLICY)
+    if profile.get("mode") == "research":
+        sections.append(WORKER_RESEARCH_MODE_POLICY)
+    return "\n\n".join(section for section in sections if section).strip()
+
+
+def _compose_evaluator_system(profile: dict, monitor: bool = False) -> str:
+    sections = [
+        EVALUATOR_BASE_POLICY,
+        EVALUATOR_EVIDENCE_POLICY,
+        EVALUATOR_GENERALIZATION_POLICY,
+        EVALUATOR_SIMPLICITY_POLICY,
+        EVALUATOR_JSON_POLICY,
+    ]
+    if profile.get("needs_search"):
+        sections.append(EVALUATOR_RESEARCH_POLICY)
+    if profile.get("is_ml") or profile.get("needs_long_run_monitor"):
+        sections.append(EVALUATOR_ML_POLICY)
+    if monitor:
+        sections.append(MONITOR_JSON_POLICY)
+    return "\n\n".join(section for section in sections if section).strip()
+
+
+def _compose_dual_evaluator_system(profile: dict) -> str:
+    dual_json_policy = textwrap.dedent("""\
+        Return exactly one JSON object and nothing else.
+        Valid decisions here are CONTINUE, IMPROVE, REDIRECT, DONE, or GPU_PICK.
+        Use GPU_PICK only when a physical GPU re-selection is required and software-level fixes are insufficient.
+        JSON schema:
+        {
+          "decision": "CONTINUE | IMPROVE | REDIRECT | DONE | GPU_PICK",
+          "reason_type": "exploration | verification_gap | gpu_conflict | invalid_strategy | hardcoding | goal_met | no_artifact | repeated_feedback | other",
+          "next_action": "short actionable instruction for the worker",
+          "confidence": 0.0,
+          "rollback_needed": false,
+          "needs_search": false,
+          "needs_long_run_monitor": false,
+          "summary": {
+            "judgment": "Korean explanation",
+            "result_paths": ["relevant/file/path"],
+            "result_summary": "Korean one-line summary"
+          }
+        }
+    """).strip()
+    sections = [
+        EVALUATOR_BASE_POLICY,
+        EVALUATOR_EVIDENCE_POLICY,
+        EVALUATOR_GENERALIZATION_POLICY,
+        EVALUATOR_SIMPLICITY_POLICY,
+        dual_json_policy,
+    ]
+    if profile.get("needs_search"):
+        sections.append(EVALUATOR_RESEARCH_POLICY)
+    if profile.get("is_ml") or profile.get("needs_long_run_monitor"):
+        sections.append(EVALUATOR_ML_POLICY)
+    return "\n\n".join(section for section in sections if section).strip()
+
+
+def _extract_json_object(text: str):
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text[idx:])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _coerce_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _coerce_confidence(value) -> float:
+    try:
+        conf = float(value)
+    except (TypeError, ValueError):
+        return 0.5
+    return max(0.0, min(1.0, conf))
+
+
+def _decision_feedback_from_payload(payload: dict) -> str:
+    if payload.get("decision") == "DONE":
+        summary = payload.get("summary") or {}
+        return (
+            summary.get("judgment")
+            or summary.get("result_summary")
+            or payload.get("next_action")
+            or ""
+        ).strip()
+    return (
+        payload.get("next_action")
+        or payload.get("reason_type")
+        or ""
+    ).strip()
+
+
+def _make_eval_payload(
+    decision: str,
+    reason_type: str,
+    next_action: str,
+    *,
+    confidence: float = 0.75,
+    rollback_needed: bool = False,
+    needs_search: bool = False,
+    needs_long_run_monitor: bool = False,
+    judgment: str = "",
+    result_paths: list[str] | None = None,
+    result_summary: str = "",
+) -> dict:
+    payload = {
+        "decision": decision,
+        "reason_type": reason_type,
+        "next_action": next_action.strip(),
+        "confidence": _coerce_confidence(confidence),
+        "rollback_needed": bool(rollback_needed),
+        "needs_search": bool(needs_search),
+        "needs_long_run_monitor": bool(needs_long_run_monitor),
+        "summary": {
+            "judgment": judgment.strip(),
+            "result_paths": [str(p).strip() for p in (result_paths or []) if str(p).strip()],
+            "result_summary": result_summary.strip(),
+        },
+    }
+    payload["raw_text"] = json.dumps(
+        {k: v for k, v in payload.items() if k != "raw_text"},
+        ensure_ascii=False,
+    )
+    return payload
+
+
+def _attempt_has_evidence(worker_summary: str, changed_files: list[str] | None) -> bool:
+    return bool((worker_summary or "").strip()) or bool(changed_files)
+
+
+def _classify_attempt_signals(worker_output: str, worker_summary: str,
+                              changed_files: list[str] | None) -> dict:
+    text = "\n".join(part for part in (worker_output or "", worker_summary or "") if part).strip()
+    has_evidence = _attempt_has_evidence(worker_summary, changed_files)
+    auth_success = bool(_AUTH_SUCCESS_RE.search(text))
+    task_parse_failure = bool(_TASK_PARSE_FAILURE_RE.search(text))
+    return {
+        "has_evidence": has_evidence,
+        "auth_success": auth_success,
+        "task_parse_failure": task_parse_failure,
+        "auth_setup_only": auth_success and not task_parse_failure,
+    }
+
+
+def _real_history_entries(history: list | None) -> list[dict]:
+    if not history:
+        return []
+    return [h for h in history if h.get("type") != "compressed_summary"]
+
+
+def _history_entry_has_evidence(entry: dict) -> bool:
+    signals = entry.get("attempt_signals") or {}
+    if "has_evidence" in signals:
+        return bool(signals.get("has_evidence"))
+    return _attempt_has_evidence(entry.get("worker_summary", ""), entry.get("changed_files"))
+
+
+def _count_trailing_no_evidence_attempts(history: list | None) -> int:
+    count = 0
+    for entry in reversed(_real_history_entries(history)):
+        if _history_entry_has_evidence(entry):
+            break
+        count += 1
+    return count
+
+
+def _count_trailing_auth_parse_failures(history: list | None) -> int:
+    count = 0
+    for entry in reversed(_real_history_entries(history)):
+        signals = entry.get("attempt_signals") or {}
+        if signals.get("auth_success") and signals.get("task_parse_failure"):
+            count += 1
+            continue
+        break
+    return count
+
+
+def _word_jaccard(a: str, b: str) -> float:
+    ta = set(re.findall(r"[a-z0-9가-힣_]+", (a or "").lower()))
+    tb = set(re.findall(r"[a-z0-9가-힣_]+", (b or "").lower()))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _same_feedback_family(payload: dict, history_entry: dict) -> bool:
+    current_reason = str(payload.get("reason_type") or "").strip()
+    prev_meta = history_entry.get("eval_meta") or {}
+    prev_reason = str(prev_meta.get("reason_type") or history_entry.get("reason_type") or "").strip()
+    if current_reason and prev_reason and current_reason == prev_reason:
+        return True
+    current_fb = _decision_feedback_from_payload(payload)
+    prev_fb = str(history_entry.get("feedback") or "").strip()
+    return _word_jaccard(current_fb, prev_fb) >= 0.55
+
+
+def _count_trailing_similar_feedback(history: list | None, payload: dict) -> int:
+    count = 0
+    for entry in reversed(_real_history_entries(history)):
+        decision = str(entry.get("decision") or "").upper()
+        if not decision:
+            continue
+        if decision not in {"IMPROVE", "REDIRECT"}:
+            break
+        if not _same_feedback_family(payload, entry):
+            break
+        count += 1
+    return count
+
+
+def _preemptive_eval_override(history: list | None, worker_output: str,
+                              worker_summary: str, changed_files: list[str] | None) -> dict | None:
+    signals = _classify_attempt_signals(worker_output, worker_summary, changed_files)
+    no_evidence_streak = _count_trailing_no_evidence_attempts(history)
+    auth_parse_streak = _count_trailing_auth_parse_failures(history)
+
+    if signals.get("auth_success") and signals.get("task_parse_failure"):
+        if auth_parse_streak >= AUTH_PARSE_REDIRECT_THRESHOLD:
+            return _make_eval_payload(
+                "REDIRECT",
+                "task_parse_failure",
+                "로그인/인증은 이미 성공했습니다. 인증 흐름은 더 만지지 말고, 실과제 파싱 실패 계층을 분리해 다른 접근으로 수정하라.",
+                confidence=0.92,
+                rollback_needed=bool(changed_files),
+                judgment="로그인 성공과 과제 파싱 실패가 반복적으로 함께 나타났습니다.",
+                result_summary="인증 성공 이후 파싱 실패 반복",
+            )
+        return _make_eval_payload(
+            "IMPROVE",
+            "task_parse_failure",
+            "로그인/인증 성공과 과제 파싱 실패를 분리해서 처리하라. 인증 코드는 유지하고 파싱 실패 재현, 입력 확인, 추출 경로 수정에만 집중하라.",
+            confidence=0.86,
+            judgment="인증 자체는 성공했지만 실제 과제 파싱은 실패했습니다.",
+            result_summary="인증 성공 후 파싱 실패",
+        )
+
+    if not signals.get("has_evidence"):
+        if no_evidence_streak >= NO_EVIDENCE_REDIRECT_THRESHOLD:
+            return _make_eval_payload(
+                "REDIRECT",
+                "no_artifact",
+                "두 회차 연속으로 작업 증거가 없습니다. 기존 접근을 버리고, 다음 시도에서는 파일 변경·실행 결과·측정값 중 하나를 반드시 남기는 전략으로 전환하라.",
+                confidence=0.9,
+                rollback_needed=False,
+                judgment="연속 회차에서 구체적인 작업 산출물이 남지 않았습니다.",
+                result_summary="무증거 회차 반복",
+            )
+        return _make_eval_payload(
+            "CONTINUE",
+            "no_artifact",
+            "이번 회차에는 작업 증거가 없습니다. 다음 회차에는 파일 변경, 실행 결과, 측정값 중 최소 하나를 반드시 남겨라.",
+            confidence=0.72,
+            judgment="이번 회차는 구체적인 작업 산출물이 없습니다.",
+            result_summary="무증거 회차",
+        )
+    return None
+
+
+def _apply_eval_policy_overrides(history: list | None, payload: dict,
+                                 worker_output: str, worker_summary: str,
+                                 changed_files: list[str] | None) -> dict:
+    signals = _classify_attempt_signals(worker_output, worker_summary, changed_files)
+    no_evidence_streak = _count_trailing_no_evidence_attempts(history)
+    auth_parse_streak = _count_trailing_auth_parse_failures(history)
+
+    if payload.get("decision") == "DONE" and not signals.get("has_evidence") and not payload.get("summary", {}).get("result_paths"):
+        return _make_eval_payload(
+            "IMPROVE",
+            "no_artifact",
+            "검증 가능한 작업 증거가 없습니다. 파일 변경, 실행 결과, 측정값 중 하나를 먼저 남긴 뒤 완료 여부를 다시 판단하라.",
+            confidence=0.9,
+            judgment="작업 증거 없이 완료로 판정할 수 없습니다.",
+            result_summary="증거 없는 완료 판정 차단",
+        )
+
+    if signals.get("auth_success") and signals.get("task_parse_failure") and payload.get("decision") in {"CONTINUE", "IMPROVE"}:
+        if auth_parse_streak >= AUTH_PARSE_REDIRECT_THRESHOLD:
+            return _make_eval_payload(
+                "REDIRECT",
+                "task_parse_failure",
+                "로그인/인증은 이미 해결됐습니다. 인증 경로는 유지하고, 과제 파싱 실패 전용 흐름을 새 접근으로 수정하라.",
+                confidence=0.9,
+                rollback_needed=bool(changed_files),
+                judgment="인증 성공과 파싱 실패가 반복되고 있습니다.",
+                result_summary="파싱 실패 반복",
+            )
+        return _make_eval_payload(
+            "IMPROVE",
+            "task_parse_failure",
+            "로그인 성공과 과제 파싱 실패를 분리해서 다뤄라. 인증은 건드리지 말고 파싱 실패 경로만 최소 재현 후 수정하라.",
+            confidence=0.84,
+            judgment="인증은 통과했지만 과제 파싱은 실패했습니다.",
+            result_summary="인증 성공, 파싱 실패",
+        )
+
+    if not signals.get("has_evidence") and payload.get("decision") in {"CONTINUE", "IMPROVE"}:
+        if no_evidence_streak >= NO_EVIDENCE_REDIRECT_THRESHOLD:
+            return _make_eval_payload(
+                "REDIRECT",
+                "no_artifact",
+                "두 회차 연속으로 작업 증거가 없습니다. 기존 접근을 버리고, 다음 시도에서는 파일 변경·실행 결과·측정값 중 하나를 반드시 남겨라.",
+                confidence=0.9,
+                judgment="무증거 회차가 반복되고 있습니다.",
+                result_summary="무증거 회차 반복",
+            )
+        return _make_eval_payload(
+            "CONTINUE",
+            "no_artifact",
+            "이번 회차에는 작업 증거가 없습니다. 다음 회차에는 파일 변경, 실행 결과, 측정값 중 최소 하나를 반드시 남겨라.",
+            confidence=0.7,
+            judgment="이번 회차는 구체적 산출물이 없습니다.",
+            result_summary="무증거 회차",
+        )
+
+    if payload.get("decision") == "IMPROVE":
+        similar_count = _count_trailing_similar_feedback(history, payload)
+        if similar_count >= REPEATED_FEEDBACK_REDIRECT_THRESHOLD - 1:
+            repeated_note = _decision_feedback_from_payload(payload)[:180]
+            return _make_eval_payload(
+                "REDIRECT",
+                "repeated_feedback",
+                f"같은 종류의 피드백이 {similar_count + 1}회 반복되었습니다. 기존 접근을 버리고 다른 전략으로 전환하라. 이전 핵심 피드백: {repeated_note}",
+                confidence=0.88,
+                rollback_needed=bool(changed_files),
+                judgment="같은 계열의 피드백이 반복되어 현재 전략의 수익이 낮습니다.",
+                result_summary="반복 피드백 예산 초과",
+            )
+
+    return payload
+
+
+def _normalize_evaluator_payload(text: str, allow: tuple[str, ...] = ("CONTINUE", "IMPROVE", "REDIRECT", "DONE")) -> dict:
+    raw = _extract_json_object(text) or {}
+    decision = _canonicalize_evaluator_decision(raw.get("decision", ""))
+    if decision not in allow:
+        decision, fallback_feedback = parse_decision(text)
+        if decision not in allow:
+            decision = "IMPROVE" if "IMPROVE" in allow else allow[0]
+        raw.setdefault("next_action", fallback_feedback)
+
+    summary = raw.get("summary")
+    if isinstance(summary, str):
+        summary = {
+            "judgment": summary,
+            "result_paths": [],
+            "result_summary": summary,
+        }
+    if not isinstance(summary, dict):
+        summary = {}
+    result_paths = summary.get("result_paths")
+    if not isinstance(result_paths, list):
+        result_paths = []
+
+    payload = {
+        "decision": decision,
+        "reason_type": str(raw.get("reason_type") or "other").strip() or "other",
+        "next_action": str(raw.get("next_action") or "").strip(),
+        "confidence": _coerce_confidence(raw.get("confidence", 0.5)),
+        "rollback_needed": _coerce_bool(raw.get("rollback_needed")) or decision == "REDIRECT",
+        "needs_search": _coerce_bool(raw.get("needs_search")),
+        "needs_long_run_monitor": _coerce_bool(raw.get("needs_long_run_monitor")),
+        "summary": {
+            "judgment": str(summary.get("judgment") or "").strip(),
+            "result_paths": [str(p).strip() for p in result_paths if str(p).strip()],
+            "result_summary": str(summary.get("result_summary") or "").strip(),
+        },
+        "raw_text": text,
+    }
+    if not payload["next_action"] and decision != "DONE":
+        payload["next_action"] = _decision_feedback_from_payload(payload) or f"(parse fallback) {text[:200]}"
+    return payload
+
 
 def _call_compressor(entries: list[dict], goal: str, model: str | None) -> str:
     """과거 history entries를 LLM으로 요약. 실패 시 원본 한 줄 요약 반환."""
@@ -2482,25 +3763,25 @@ def _call_compressor(entries: list[dict], goal: str, model: str | None) -> str:
         ws = h.get('worker_summary', '')
         if ws:
             lines.append(f"    Worker did: {ws[:200]}")
+        eval_meta = h.get("eval_meta") or {}
+        if eval_meta.get("reason_type"):
+            lines.append(f"    Reason type: {eval_meta['reason_type']}")
+        if eval_meta.get("next_action"):
+            lines.append(f"    Next action: {eval_meta['next_action'][:180]}")
+        if h.get("changed_files"):
+            lines.append(f"    Changed files: {', '.join(h['changed_files'][:8])}")
     prompt_text = "\n".join(lines)
 
     model = model or DEFAULT_EVAL_MODEL
-    payload = {
-        "model": model,
-        "instructions": COMPRESSOR_SYSTEM,
-        "input": [{"role": "user", "content": prompt_text}],
-        "store": False,
-        "stream": True,
-    }
-    parts: list[str] = []
-    gen = _iter_events(payload)
-    try:
-        for ev in gen:
-            if ev["type"] == "response.output_text.delta":
-                parts.append(ev.get("delta", ""))
-    finally:
-        gen.close()
-    result = "".join(parts).strip()
+    result, rc = _run_text_completion(
+        prompt_text,
+        _current_session_workdir(),
+        model,
+        system_prompt=COMPRESSOR_SYSTEM,
+        sandbox="read-only",
+    )
+    if rc != 0:
+        result = ""
     if not result:
         # 폴백: 원본 한 줄 목록
         result = "\n".join(
@@ -2550,8 +3831,16 @@ def compress_history(history: list, goal: str, model: str | None) -> list:
 
 def build_worker_prompt(goal: str, history: list,
                         past_attempts: list[dict] | None = None,
-                        session_context: list[dict] | None = None) -> str:
+                        session_context: list[dict] | None = None,
+                        policy_profile: dict | None = None) -> str:
     lines = [f"GOAL: {goal}", ""]
+    profile = policy_profile or {}
+
+    if profile:
+        labels = ", ".join(profile.get("labels", []))
+        if labels:
+            lines.append(f"ACTIVE POLICIES: {labels}")
+            lines.append("")
 
     # 같은 REPL 세션에서 이전에 완료한 목표들의 컨텍스트
     if session_context:
@@ -2577,7 +3866,7 @@ def build_worker_prompt(goal: str, history: list,
             lines.append("")
 
     if not history:
-        lines += [WORKER_SYSTEM, "", "Begin working on the goal above. Make concrete changes now."]
+        lines.append("Begin working on the goal above. Make concrete changes now.")
     else:
         lines.append("ITERATION HISTORY:")
         for h in history:
@@ -2595,10 +3884,22 @@ def build_worker_prompt(goal: str, history: list,
         # 마지막 실제 iteration entry 찾기
         last = next((h for h in reversed(history) if h.get('type') != 'compressed_summary'), None)
         if last:
-            if last['decision'].upper() == 'IMPROVE':
+            eval_meta = last.get("eval_meta") or {}
+            last_decision = last['decision'].upper()
+            if last_decision in ('IMPROVE', 'CONTINUE'):
                 lines.append(f"INSTRUCTION: Refine your previous work. Feedback: {last['feedback']}")
-            else:
+            elif last_decision == 'REDIRECT':
                 lines.append(f"INSTRUCTION: Abandon previous approach. Try differently: {last['feedback']}")
+            elif last_decision == 'DONE':
+                lines.append("INSTRUCTION: The goal was previously judged complete. Only make further changes if the current run explicitly requires verification or packaging.")
+            if eval_meta.get("reason_type"):
+                lines.append(f"EVALUATOR REASON TYPE: {eval_meta['reason_type']}")
+            if eval_meta.get("needs_search"):
+                lines.append("EVALUATOR SIGNAL: targeted external research is needed before the next edit.")
+            if eval_meta.get("needs_long_run_monitor"):
+                lines.append("EVALUATOR SIGNAL: the next meaningful step likely requires a monitored long-running job.")
+            if eval_meta.get("confidence") is not None:
+                lines.append(f"EVALUATOR CONFIDENCE: {eval_meta['confidence']:.2f}")
         lines.append("Make the changes now.")
     return "\n".join(lines)
 
@@ -2643,6 +3944,53 @@ def _get_workspace_snapshot(workdir: str) -> str:
     return "\n".join(lines)
 
 
+_METRIC_VALUE_RE = re.compile(
+    r'\b(PMAE|loss|val_loss|accuracy|acc|f1|auc|map|score)\s*[=:]\s*([-+]?[0-9]*\.?[0-9]+(?:e[-+]?\d+)?)',
+    re.I,
+)
+
+
+def _collect_changed_files(workdir: str) -> list[str]:
+    changed: list[str] = []
+    try:
+        diff = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            capture_output=True, text=True, cwd=workdir, timeout=10,
+        )
+        status = subprocess.run(
+            ["git", "status", "--short"],
+            capture_output=True, text=True, cwd=workdir, timeout=10,
+        )
+        for line in diff.stdout.splitlines():
+            line = line.strip()
+            if line and line not in changed:
+                changed.append(line)
+        for line in status.stdout.splitlines():
+            path = line[3:].strip() if len(line) > 3 else ""
+            if path and path not in changed:
+                changed.append(path)
+    except Exception:
+        pass
+    return changed[:20]
+
+
+def _extract_metric_events(text: str) -> list[dict]:
+    metrics: dict[str, str] = {}
+    for name, value in _METRIC_VALUE_RE.findall(text or ""):
+        metrics[name.lower()] = value
+    return [
+        {"metric_name": name, "metric_value": value}
+        for name, value in metrics.items()
+    ]
+
+
+def _tool_result_summary(result: str) -> str:
+    if not result:
+        return ""
+    line = result.replace("\n", " ").strip()
+    return line[:240]
+
+
 def _get_gpu_status() -> str | None:
     """nvidia-smi snapshot; returns None if not available."""
     try:
@@ -2673,9 +4021,11 @@ def _get_gpu_status() -> str | None:
 def build_evaluator_prompt(goal: str, worker_output: str, iteration: int,
                            workdir: str = ".",
                            past_attempts: list[dict] | None = None,
-                           history: list | None = None) -> str:
+                           history: list | None = None,
+                           policy_profile: dict | None = None) -> str:
     snapshot = _get_workspace_snapshot(workdir)
     gpu_status = _get_gpu_status()
+    profile = policy_profile or {}
     # IMPROVE 연속 횟수 계산
     improve_count = 0
     if history:
@@ -2687,13 +4037,28 @@ def build_evaluator_prompt(goal: str, worker_output: str, iteration: int,
             else:
                 break
     parts = [
-        EVALUATOR_SYSTEM,
-        "",
         f"ORIGINAL GOAL: {goal}",
         f"CURRENT ITERATION: {iteration}",
     ]
+    if profile:
+        labels = ", ".join(profile.get("labels", []))
+        if labels:
+            parts.append(f"ACTIVE POLICIES: {labels}")
     if improve_count >= 3:
         parts.append(f"⚠ IMPROVE/REDIRECT issued {improve_count} times in a row without resolution.")
+    current_entry = next((h for h in reversed(history or []) if h.get('type') != 'compressed_summary'), None)
+    current_signals = (current_entry or {}).get("attempt_signals") or {}
+    if current_entry:
+        if not current_signals.get("has_evidence", True):
+            parts.append(
+                f"⚠ NO-EVIDENCE STREAK: {_count_trailing_no_evidence_attempts(history)} "
+                "(empty worker summary and no changed files)."
+            )
+        if current_signals.get("auth_success") and current_signals.get("task_parse_failure"):
+            parts.append(
+                f"⚠ AUTH/PARSE SIGNAL: login/auth appears successful, but task parsing failed "
+                f"({_count_trailing_auth_parse_failures(history)} time(s) in a row)."
+            )
     parts.append("")
     # RAG: 과거 시도 중 현재 워커 출력과 관련된 것 삽입
     if past_attempts:
@@ -2722,7 +4087,7 @@ def build_evaluator_prompt(goal: str, worker_output: str, iteration: int,
         worker_output[-3000:].strip(),
         "─" * 60,
         "",
-        "Now evaluate. First line must be DONE, IMPROVE: ..., or REDIRECT: ...",
+        "Return exactly one JSON object following the evaluator schema.",
     ]
     return "\n".join(parts)
 
@@ -2750,7 +4115,11 @@ def cmd_auth_login(device: bool = False):
     console.print(Rule("[cyan]agentforge — 로그인[/cyan]"))
     if not device and not sys.stdout.isatty():
         console.print("[yellow]SSH 환경 감지됨. --device 플래그를 권장합니다.[/yellow]\n")
-    cmd = [str(CODEX_BIN), "login"]
+    codex_bin = _get_codex_bin()
+    if codex_bin is None:
+        console.print(f"[red]codex 실행 파일을 찾지 못했습니다.[/red] [dim]({_codex_display_path()})[/dim]")
+        sys.exit(1)
+    cmd = [str(codex_bin), "login"]
     if device:
         cmd.append("--device-auth")
     result = subprocess.run(cmd)
@@ -2766,7 +4135,11 @@ def cmd_auth_login(device: bool = False):
 
 def cmd_auth_logout():
     console.print(Rule("[cyan]agentforge — 로그아웃[/cyan]"))
-    result = subprocess.run([str(CODEX_BIN), "logout"])
+    codex_bin = _get_codex_bin()
+    if codex_bin is None:
+        console.print(f"[red]codex 실행 파일을 찾지 못했습니다.[/red] [dim]({_codex_display_path()})[/dim]")
+        sys.exit(1)
+    result = subprocess.run([str(codex_bin), "logout"])
     if result.returncode == 0:
         console.print("[green]✓ 로그아웃 완료[/green]")
     else:
@@ -2861,22 +4234,15 @@ def _fetch_paper_and_extract(url: str, eval_model: str | None) -> str | None:
         return None
 
     console.print(f"[dim]논문 분석 중 (LLM)...[/dim]")
-    payload = {
-        "model": eval_model or DEFAULT_EVAL_MODEL,
-        "instructions": PAPER_EXTRACTOR_SYSTEM,
-        "input": [{"role": "user", "content": f"PAPER TEXT:\n{paper_text}"}],
-        "store": False,
-        "stream": True,
-    }
-    parts: list[str] = []
-    gen = _iter_events(payload)
-    try:
-        for ev in gen:
-            if ev.get("type") == "response.output_text.delta":
-                parts.append(ev.get("delta", ""))
-    finally:
-        gen.close()
-    result = "".join(parts).strip()
+    result, rc = _run_text_completion(
+        f"PAPER TEXT:\n{paper_text}",
+        _current_session_workdir(),
+        eval_model or DEFAULT_EVAL_MODEL,
+        system_prompt=PAPER_EXTRACTOR_SYSTEM,
+        sandbox="read-only",
+    )
+    if rc != 0:
+        result = ""
     if not result:
         return None
 
@@ -2896,21 +4262,15 @@ def _fetch_paper_and_extract(url: str, eval_model: str | None) -> str | None:
 def split_goal_to_tasks(goal: str, model: str | None) -> tuple[str, str]:
     """Coordinator LLM → (task_a, task_b). 실패 시 (goal, goal) 폴백."""
     console.print("[dim]Coordinator: 목표를 두 작업으로 분리 중...[/dim]")
-    payload = {
-        "model": model or DEFAULT_EVAL_MODEL,
-        "instructions": COORDINATOR_SYSTEM,
-        "input": [{"role": "user", "content": f"GOAL: {goal}"}],
-        "store": False, "stream": True,
-    }
-    parts: list[str] = []
-    gen = _iter_events(payload)
-    try:
-        for ev in gen:
-            if ev.get("type") == "response.output_text.delta":
-                parts.append(ev.get("delta", ""))
-    finally:
-        gen.close()
-    text = "".join(parts).strip()
+    text, rc = _run_text_completion(
+        f"GOAL: {goal}",
+        _current_session_workdir(),
+        model or DEFAULT_EVAL_MODEL,
+        system_prompt=COORDINATOR_SYSTEM,
+        sandbox="read-only",
+    )
+    if rc != 0:
+        text = ""
     tasks = {m.group(1).upper(): m.group(2).strip()
              for m in _TASK_RE.finditer(text)}
     task_a = tasks.get("A") or goal
@@ -2925,11 +4285,173 @@ def split_goal_to_tasks(goal: str, model: str | None) -> tuple[str, str]:
 
 # ── Agent Runners ─────────────────────────────────────────────────────────────
 
+def _trim_fast_worker_text(text: str, limit: int = 1200) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    head = max(200, limit // 2 - 10)
+    tail = max(200, limit - head - 16)
+    return text[:head] + "\n... [truncated] ...\n" + text[-tail:]
+
+
+def _fast_worker_system_prompt(system_prompt: str) -> str:
+    runtime_note = textwrap.dedent("""\
+        FAST TRANSPORT RUNTIME:
+        - You are running through the official Codex CLI agent, not the legacy custom tool API.
+        - Use Codex's built-in shell, file editing, and patch application abilities directly.
+        - Native web search may be available; use it only when genuinely needed.
+        - There is NO custom shell_background tool in this runtime. If you start a long-running job,
+          launch it yourself in the shell, redirect stdout/stderr to a log file, and make the shell
+          print EXACTLY:
+            PID:<pid>
+            LOG:<absolute log path>
+          Then end your turn without waiting.
+        - There is NO custom data_profile tool in this runtime. If you need data inspection,
+          use shell/Python commands directly.
+        - MCP tools from agentforge are not available in this runtime.
+    """).strip()
+    return f"{system_prompt.strip()}\n\n{runtime_note}"
+
+
+def _run_worker_fast(
+    prompt: str,
+    workdir: str,
+    model: str,
+    buf: deque,
+    status_ref: list,
+    *,
+    system_prompt: str,
+    tools: list | None = None,
+    worker_id: int = 0,
+    goal_context: str | None = None,
+    iteration_id: int | str | None = None,
+    last_spoken_ref: list[str] | None = None,
+) -> tuple[str, int]:
+    if any(str(t.get("name", "")).startswith("mcp__") for t in (tools or [])):
+        buf.append("[yellow]Fast transport는 MCP 툴과 함께 사용할 수 없어 기본 transport로 폴백합니다.[/yellow]")
+        status_ref[0] = "running"
+        return "", -1
+
+    search_enabled = any(
+        str(t.get("name", "")) in {"web_search", "fetch_url"}
+        for t in (tools or [])
+    )
+    transcript_parts: list[str] = []
+    fallback_command_parts: list[str] = []
+    background_marker_parts: list[str] = []
+    line_buf = ""
+    active_commands: dict[str, str] = {}
+    status_ref[0] = "running"
+
+    def _flush_line(text: str):
+        nonlocal line_buf
+        line_buf += text
+        while '\n' in line_buf:
+            ln, line_buf = line_buf.split('\n', 1)
+            spoken = _normalize_worker_status_line(ln)
+            if spoken:
+                if last_spoken_ref is not None:
+                    last_spoken_ref[0] = spoken
+                buf.append(colorize_line(ln))
+
+    for ev in _iter_codex_exec_events(
+        prompt,
+        workdir,
+        model,
+        system_prompt=_fast_worker_system_prompt(system_prompt),
+        search=search_enabled,
+        sandbox="workspace-write",
+    ):
+        evtype = ev.get("type")
+        if evtype == "_error":
+            reason = ev.get("message", "unknown error")
+            _force_disable_fast_mode(reason)
+            buf.append(f"[yellow]Fast transport 오류 → fast를 끄고 기본 transport로 재시도합니다.[/yellow]")
+            buf.append(f"[dim]{reason}[/dim]")
+            status_ref[0] = "running"
+            if line_buf.strip():
+                spoken = _normalize_worker_status_line(line_buf)
+                if spoken and last_spoken_ref is not None:
+                    last_spoken_ref[0] = spoken
+                buf.append(colorize_line(line_buf))
+            _dbg(f"W{worker_id}" if worker_id else "WORKER", f"FAST_FALLBACK  reason={reason}")
+            return "", -1
+
+        if evtype not in {"item.started", "item.completed"}:
+            continue
+
+        item = ev.get("item") or {}
+        item_type = item.get("type")
+        item_id = str(item.get("id") or "")
+
+        if item_type == "command_execution" and evtype == "item.started":
+            command = str(item.get("command") or "").strip()
+            active_commands[item_id] = command
+            if command:
+                buf.append(f"[cyan]▶ {command[:180]}[/cyan]")
+            continue
+
+        if item_type == "command_execution" and evtype == "item.completed":
+            command = str(item.get("command") or active_commands.pop(item_id, "")).strip()
+            output = str(item.get("aggregated_output") or "")
+            exit_code = item.get("exit_code")
+            preview = _tool_result_summary(output)
+            if preview:
+                buf.append(f"[dim]{_osc8_linkify(preview.replace(chr(10), ' '))}[/dim]")
+            elif command:
+                buf.append(f"[dim](exit {exit_code})[/dim]")
+            trimmed = _trim_fast_worker_text(output)
+            if trimmed:
+                _flush_line(trimmed + "\n")
+            capture_parts: list[str] = []
+            if command:
+                capture_parts.append(f"$ {command}")
+            if trimmed:
+                capture_parts.append(trimmed)
+            capture_text = "\n".join(part for part in capture_parts if part).strip()
+            if capture_text:
+                if _BG_PID_RE.search(output) or _BG_LOG_RE.search(output):
+                    background_marker_parts.append(capture_text)
+                else:
+                    fallback_command_parts.append(capture_text)
+            if goal_context:
+                _append_memory_event(goal_context, {
+                    "event_type": "command_execution",
+                    "iter": iteration_id,
+                    "worker_id": worker_id,
+                    "command": command[:300],
+                    "exit_code": exit_code,
+                    "result_summary": preview,
+                })
+            continue
+
+        if item_type == "agent_message" and evtype == "item.completed":
+            text = str(item.get("text") or "").strip()
+            if text:
+                transcript_parts.append(text)
+                _flush_line(text + "\n")
+            continue
+
+    if line_buf.strip():
+        spoken = _normalize_worker_status_line(line_buf)
+        if spoken and last_spoken_ref is not None:
+            last_spoken_ref[0] = spoken
+        buf.append(colorize_line(line_buf))
+    status_ref[0] = "done"
+    final_parts = [part for part in transcript_parts if part]
+    final_parts.extend(background_marker_parts)
+    if not transcript_parts:
+        final_parts.extend(fallback_command_parts)
+    return "\n\n".join(part for part in final_parts if part).strip(), 0
+
 def run_worker(prompt: str, workdir: str, model: str | None,
                buf: deque, status_ref: list,
                system_prompt: str | None = None,
                tools: list | None = None,
-               worker_id: int = 0) -> tuple[str, int]:
+               worker_id: int = 0,
+               goal_context: str | None = None,
+               iteration_id: int | str | None = None,
+               last_spoken_ref: list[str] | None = None) -> tuple[str, int]:
     """Worker: ChatGPT backend Responses API 직접 호출 + 병렬 도구 실행 루프."""
     # ── DEBUG: worker 시작 ────────────────────────────────────────────────────
     _wlabel = f"W{worker_id}" if worker_id else "WORKER"
@@ -2939,6 +4461,27 @@ def run_worker(prompt: str, workdir: str, model: str | None,
     model = model or DEFAULT_WORKER_MODEL
     system_prompt = system_prompt or WORKER_SYSTEM
     tools = tools if tools is not None else WORKER_TOOLS
+    if last_spoken_ref is not None:
+        last_spoken_ref[0] = ""
+
+    if _fast_mode_active():
+        fast_result, fast_rc = _run_worker_fast(
+            prompt,
+            workdir,
+            model,
+            buf,
+            status_ref,
+            system_prompt=system_prompt,
+            tools=tools,
+            worker_id=worker_id,
+            goal_context=goal_context,
+            iteration_id=iteration_id,
+            last_spoken_ref=last_spoken_ref,
+        )
+        if fast_rc >= 0:
+            _dbg(_wlabel, f"RUN_END    elapsed={time.time()-_wt0:.2f}s fast={fast_rc == 0}")
+            return fast_result, fast_rc
+
     status_ref[0] = "running"
 
     # 입력 히스토리 (user msg + function_call + function_call_output 누적)
@@ -2951,7 +4494,10 @@ def run_worker(prompt: str, workdir: str, model: str | None,
         line_buf += text
         while '\n' in line_buf:
             ln, line_buf = line_buf.split('\n', 1)
-            if ln.strip() and not NOISE_RE.match(ln):
+            spoken = _normalize_worker_status_line(ln)
+            if spoken:
+                if last_spoken_ref is not None:
+                    last_spoken_ref[0] = spoken
                 buf.append(colorize_line(ln))
 
     for _round in range(30):
@@ -2978,6 +4524,9 @@ def run_worker(prompt: str, workdir: str, model: str | None,
                 buf.append(f"[red]API 오류: {ev['message']}[/red]")
                 status_ref[0] = "error"
                 if line_buf.strip():
+                    spoken = _normalize_worker_status_line(line_buf)
+                    if spoken and last_spoken_ref is not None:
+                        last_spoken_ref[0] = spoken
                     buf.append(colorize_line(line_buf))
                 got_error = True
                 break
@@ -3029,6 +4578,24 @@ def run_worker(prompt: str, workdir: str, model: str | None,
             result = results[fc["call_id"]]
             buf.append(f"[cyan]▶ {fc['name']}({fc['arguments'][:80]})[/cyan]")
             buf.append(f"[dim]{_osc8_linkify(result[:300].replace(chr(10), ' '))}[/dim]")
+            if goal_context:
+                try:
+                    event_args = json.loads(fc["arguments"]) if fc["arguments"] else {}
+                except Exception:
+                    event_args = {}
+                event = {
+                    "event_type": "tool_call",
+                    "iter": iteration_id,
+                    "worker_id": worker_id,
+                    "tool_name": fc["name"],
+                    "arguments": fc["arguments"][:500],
+                    "result_summary": _tool_result_summary(result),
+                }
+                if fc["name"] in {"shell", "shell_background"}:
+                    event["command"] = str(event_args.get("command", ""))[:300]
+                if fc["name"] in {"read_file", "write_file", "list_files", "data_profile"}:
+                    event["path"] = str(event_args.get("path", ""))[:300]
+                _append_memory_event(goal_context, event)
             input_history.append({"type": "function_call", "call_id": fc["call_id"],
                                    "name": fc["name"], "arguments": fc["arguments"]})
             input_history.append({"type": "function_call_output", "call_id": fc["call_id"],
@@ -3036,6 +4603,9 @@ def run_worker(prompt: str, workdir: str, model: str | None,
 
     # 잔여 line_buf flush
     if line_buf.strip():
+        spoken = _normalize_worker_status_line(line_buf)
+        if spoken and last_spoken_ref is not None:
+            last_spoken_ref[0] = spoken
         buf.append(colorize_line(line_buf))
 
     status_ref[0] = "done"
@@ -3046,54 +4616,43 @@ def run_worker(prompt: str, workdir: str, model: str | None,
 
 
 def run_evaluator(prompt: str, workdir: str, model: str | None,
-                  system_prompt: str | None = None) -> tuple[str, int]:
-    """Evaluator: ChatGPT backend Responses API, 도구 없이 텍스트만.
-    IMPROVE/REDIRECT는 첫 번째 완성 라인에서 결정 → 스트림 조기 종료.
-    DONE은 한국어 요약까지 필요하므로 전체 수신.
-    """
+                  system_prompt: str | None = None,
+                  output_schema: dict | None = None,
+                  retry_invalid_json: bool = False) -> tuple[str, int]:
+    """Evaluator: ChatGPT backend Responses API, 도구 없이 텍스트만."""
     # ── DEBUG: evaluator 시작 ─────────────────────────────────────────────────
     _dbg("EVAL", f"RUN_START  model={model or DEFAULT_EVAL_MODEL}")
     _et0 = time.time()
     # ── END DEBUG ────────────────────────────────────────────────────────────
     model = model or DEFAULT_EVAL_MODEL
     system_prompt = system_prompt or EVALUATOR_SYSTEM
-    payload = {
-        "model": model,
-        "instructions": system_prompt,
-        "input": [{"role": "user", "content": prompt}],
-        "store": False,
-        "stream": True,
-    }
-    parts: list[str] = []
-    accumulated = ""
-    early_decided = False
-    gen = _iter_events(payload)
-    try:
-        for ev in gen:
-            if ev["type"] == "_error":
-                # ── DEBUG ──────────────────────────────────────────────────
-                _dbg("EVAL", f"RUN_ERROR  elapsed={time.time()-_et0:.2f}s")
-                # ── END DEBUG ──────────────────────────────────────────────
-                return f"[Evaluator error] {ev['message']}", 1
-            if ev["type"] == "response.output_text.delta":
-                delta = ev.get("delta", "")
-                parts.append(delta)
-                if not early_decided:
-                    accumulated += delta
-                    # 첫 줄이 완성되면 결정 파싱 시도
-                    if '\n' in accumulated:
-                        first_line = accumulated.split('\n')[0].strip()
-                        m = DECISION_RE.match(first_line)
-                        if m and m.group(1).upper() in ('IMPROVE', 'REDIRECT'):
-                            early_decided = True
-                            break  # 한국어 요약 불필요 → 스트림 종료
-    finally:
-        gen.close()
+    def _invoke_once(active_prompt: str) -> tuple[str, int]:
+        return _run_text_completion(
+            active_prompt,
+            workdir,
+            model,
+            system_prompt=system_prompt,
+            sandbox="read-only",
+            output_schema=output_schema,
+        )
+
+    result, rc = _invoke_once(prompt)
+    if rc == 0 and retry_invalid_json and _fast_mode_active() and _fast_evaluator_response_invalid(result):
+        retry_prompt = (
+            prompt
+            + "\n\nIMPORTANT: Your previous response violated the required JSON contract. "
+              "Return ONLY one JSON object that matches the schema. "
+              "Allowed decision values: CONTINUE, IMPROVE, REDIRECT, DONE, GPU_PICK, KILL."
+        )
+        result, rc = _invoke_once(retry_prompt)
+    if rc != 0:
+        _dbg("EVAL", f"RUN_ERROR  elapsed={time.time()-_et0:.2f}s")
+        return f"[Evaluator error] {result}", 1
     # ── DEBUG: evaluator 완료 ─────────────────────────────────────────────────
-    _result_preview = "".join(parts)[:60].replace("\n", " ")
+    _result_preview = result[:60].replace("\n", " ")
     _dbg("EVAL", f"RUN_END    elapsed={time.time()-_et0:.2f}s  result={_result_preview}")
     # ── END DEBUG ────────────────────────────────────────────────────────────
-    return "".join(parts), 0
+    return result, 0
 
 
 def parse_decision(text: str) -> tuple[str, str]:
@@ -3103,6 +4662,15 @@ def parse_decision(text: str) -> tuple[str, str]:
     lower = text.lower()
     if any(w in lower for w in ['task is complete', 'fully complete', 'goal achieved', 'all done']):
         return 'DONE', ''
+    # 키워드 포함 여부로 fallback (순서: DONE > REDIRECT > IMPROVE > CONTINUE)
+    if 'done' in lower:
+        return 'DONE', text
+    if 'redirect' in lower:
+        return 'REDIRECT', text
+    if 'improve' in lower:
+        return 'IMPROVE', text
+    if 'continue' in lower:
+        return 'CONTINUE', text
     return 'IMPROVE', f"(parse failed) {text[:200]}"
 
 
@@ -3156,33 +4724,57 @@ def render_summary_bar(task_a: str, task_b: str, s1: str, s2: str) -> Panel:
     return Panel(content, border_style="dim", box=box.SIMPLE, padding=(0, 1))
 
 
-def render_cmd_bar(buf1, buf2, status1: str, status2: str) -> Panel:
-    """하단 상태바: 각 Worker가 현재 실행 중인 마지막 도구 호출 표시."""
+def render_cmd_bar(buf1, buf2, status1: str, status2: str,
+                   spoken1: str = "", spoken2: str = "") -> Panel:
+    """하단 상태바: 각 Worker의 현재 명령과 마지막 자연어 상태 표시."""
     import re as _re
+    import shutil as _sh
     _markup_re = _re.compile(r'\[/?[a-zA-Z#][^\]]*\]')
+
+    def _clean_line(line: str) -> str:
+        clean = _markup_re.sub('', line or "")
+        return _normalize_worker_status_line(clean)
 
     def last_cmd(buf, status: str) -> str:
         # 버퍼에서 마지막 ▶ 도구 호출 라인 추출
         for line in reversed(list(buf)):
-            clean = _markup_re.sub('', line).strip()
-            if clean.startswith('▶'):
-                # 터미널 너비에 맞게 자름
-                import shutil as _sh
-                w = max(30, _sh.get_terminal_size(fallback=(80, 40)).columns // 2 - 12)
-                return clean[:w] + ("…" if len(clean) > w else "")
+            clean = _clean_line(line)
+            if not clean:
+                continue
+            idx = clean.find('▶')
+            if idx >= 0:
+                return clean[idx + 1:].strip()
         if status == "running":
-            return "[dim]실행 준비 중...[/dim]"
+            return "실행 준비 중..."
         if status == "done":
-            return "[green dim]완료[/green dim]"
-        return "[dim]대기 중[/dim]"
+            return "완료"
+        if status == "error":
+            return "오류"
+        return "대기 중"
+
+    line_w = max(36, _sh.get_terminal_size(fallback=(80, 40)).columns - 18)
+
+    def render_line(label: str, color: str, buf, status: str, spoken: str) -> str:
+        spoken_clean = _normalize_worker_status_line(spoken)
+        cmd_text = last_cmd(buf, status)
+        if status == "running" and spoken_clean:
+            spoken_w = max(18, min(48, line_w // 3))
+            cmd_w = max(18, line_w - spoken_w - 9)
+            cmd_text = _trim_ui_text(cmd_text, cmd_w)
+            spoken_text = _trim_ui_text(spoken_clean, spoken_w)
+            body = (
+                f"{_escape_markup(cmd_text)} "
+                f"[dim]| 상태:[/dim] {_escape_markup(spoken_text)}"
+            )
+        else:
+            body = _escape_markup(_trim_ui_text(cmd_text, line_w))
+        return f"[{color}]{label}[/{color}] [dim]▶[/dim] {body}"
 
     c1 = "yellow" if status1 == "running" else "dim"
     c2 = "cyan"   if status2 == "running" else "dim"
-    line1 = last_cmd(buf1, status1)
-    line2 = last_cmd(buf2, status2)
     content = (
-        f"[{c1}]W1[/{c1}] [dim]▶[/dim] {line1}\n"
-        f"[{c2}]W2[/{c2}] [dim]▶[/dim] {line2}"
+        f"{render_line('W1', c1, buf1, status1, spoken1)}\n"
+        f"{render_line('W2', c2, buf2, status2, spoken2)}"
     )
     return Panel(content, title="[dim]현재 실행 중[/dim]",
                  border_style="dim", box=box.SIMPLE, padding=(0, 1))
@@ -3245,25 +4837,11 @@ def _osc8_linkify(text: str) -> str:
 def render_worker_panel(buf: deque, iteration: int, status: str,
                         history: list, done: bool, label: str = "WORKER") -> Panel:
     lines = []
-    # 오래된 기록 (직전 제외): summary 한 줄 + 배지
-    for h in history[:-1]:
-        badge = _DECISION_BADGE.get(h['decision'], '[dim]?[/dim]')
-        summary = (h['worker_summary'] or '')[:70]
-        lines.append(f"[dim]Iter {h['iter']}[/dim] {badge} [dim]{summary}[/dim]")
-    # 직전 기록: worker_lines 최대 8줄 (밝게)
-    if history:
-        h = history[-1]
-        lines.append(f"[bold]── Iter {h['iter']} ──────────────────────────────[/bold]")
-        for l in h.get('worker_lines', [])[-8:]:
-            lines.append(f"[white]{l}[/white]")
-    # 현재 스트리밍
-    if buf or status == "running":
-        if history:
-            lines.append(f"[yellow bold]── Iter {iteration} (실행 중) ──────────────[/yellow bold]")
-        for line in list(buf):
-            lines.append(line)
-        if status == "running":
-            lines.append("[yellow blink]▌[/yellow blink]")
+    # 현재 스트리밍만 표시
+    for line in list(buf):
+        lines.append(line)
+    if status == "running":
+        lines.append("[yellow blink]▌[/yellow blink]")
     border = "green" if done else "yellow"
     is_active = (status == "running")
     if done:
@@ -3283,23 +4861,8 @@ def render_worker_panel(buf: deque, iteration: int, status: str,
 def render_evaluator_panel(eval_history: list, iteration: int,
                            phase: str, done: bool) -> Panel:
     lines = []
-    # 최근 기록만 표시 (최신 제외): 배지 + 요약 한 줄
-    for e in eval_history[-15:-1]:
-        d, fb = e['decision'], e['feedback']
-        short_fb = fb[:65] + ('…' if len(fb) > 65 else '')
-        if e.get('type') == 'monitor':
-            badge = {"DONE": "[green]✓[/green]",
-                     "CONTINUE": "[blue]→[/blue]",
-                     "KILL": "[red]✗[/red]"}.get(d, '[dim]?[/dim]')
-            lines.append(f"[dim]Poll {e['iter']}[/dim] {badge} [dim]{short_fb}[/dim]")
-        else:
-            badge = {"DONE": "[green]✓ DONE[/green]",
-                     "IMPROVE": "[yellow]IMPROVE[/yellow]",
-                     "REDIRECT": "[red]REDIRECT[/red]"}.get(d, d)
-            lines.append(f"[dim]Iter {e['iter']}[/dim] {badge} [dim]{short_fb}[/dim]")
-    # 최신 기록: 전체 피드백 표시
-    if eval_history:
-        e = eval_history[-1]
+    recent = list(eval_history[-3:]) if eval_history else []
+    for idx, e in enumerate(recent):
         d, fb, fm = e['decision'], e['feedback'], e.get('full_msg', '')
         lines.append(f"[bold]── Iter {e['iter']} ──────────────────────────────[/bold]")
         if d == 'DONE':
@@ -3315,6 +4878,20 @@ def render_evaluator_panel(eval_history: list, iteration: int,
         elif d == 'REDIRECT':
             lines.append("[bold red]↩ REDIRECT[/bold red]")
             lines.append(f"[red]{fb}[/red]")
+        elif d == 'CONTINUE':
+            lines.append("[bold cyan]… CONTINUE[/bold cyan]")
+            if fb:
+                lines.append(f"[cyan]{fb}[/cyan]")
+        elif d == 'GPU_PICK':
+            lines.append("[bold red]! GPU_PICK[/bold red]")
+            if fb:
+                lines.append(f"[red]{fb}[/red]")
+        elif d == 'KILL':
+            lines.append("[bold red]✖ KILL[/bold red]")
+            if fb:
+                lines.append(f"[red]{fb}[/red]")
+        if idx != len(recent) - 1:
+            lines.append("[dim]" + "─" * 18 + "[/dim]")
         lines.append("")
     if phase == "evaluator":
         lines.append(f"[magenta bold]── Iter {iteration} (평가 중) ──────────────[/magenta bold]")
@@ -3650,6 +5227,8 @@ def _run_ab_strategy(
     eval_model: str | None, past_attempts: list,
     worker_buf: deque, iteration: int, refresh,
     code_only: bool = False,
+    policy_profile: dict | None = None,
+    last_spoken_ref: list[str] | None = None,
 ) -> tuple[str | None, str]:
     """
     2개의 Worker를 서로 다른 전략으로 순차 실행하고 Evaluator가 더 나은 쪽 채택.
@@ -3708,14 +5287,21 @@ def _run_ab_strategy(
             worker_buf.append(f"[cyan bold]── 전략 {label} ─────────────────────────────[/cyan bold]")
             refresh("worker", iteration)
 
-            prompt = build_worker_prompt(goal, history, past_attempts=past_attempts) + hint
+            prompt = build_worker_prompt(
+                goal,
+                history,
+                past_attempts=past_attempts,
+                policy_profile=policy_profile,
+            ) + hint
             buf_tmp: deque = deque(maxlen=WORKER_BUF_LINES)
             status_tmp = ["idle"]
             res: list = [None]
 
             def _w(p=prompt, b=buf_tmp, s=status_tmp):
                 out, _ = run_worker(p, workdir, worker_model, b, s,
-                                    system_prompt=worker_sys, tools=active_tools)
+                                    system_prompt=worker_sys, tools=active_tools,
+                                    goal_context=goal, iteration_id=iteration,
+                                    last_spoken_ref=last_spoken_ref)
                 res[0] = out
 
             t = threading.Thread(target=_w, daemon=True)
@@ -3916,10 +5502,17 @@ def _run_monitor_loop(bg: dict, goal: str, workdir: str, eval_model: str | None,
                                                command=bg.get("command", ""))
 
         refresh("evaluator", iteration)
+        monitor_profile = _detect_task_profile(goal, mode="code")
         eval_msg, _ = run_evaluator(monitor_prompt, workdir, eval_model,
-                                    system_prompt=EVALUATOR_SYSTEM)
-        decision, feedback = parse_decision(eval_msg)
-        decision = decision.upper()
+                                    system_prompt=_compose_evaluator_system(monitor_profile, monitor=True),
+                                    output_schema=_FAST_EVALUATOR_OUTPUT_SCHEMA,
+                                    retry_invalid_json=True)
+        eval_payload = _normalize_evaluator_payload(
+            eval_msg,
+            allow=("CONTINUE", "IMPROVE", "REDIRECT", "DONE"),
+        )
+        decision = eval_payload["decision"].upper()
+        feedback = _decision_feedback_from_payload(eval_payload)
 
         eval_history.append({
             "iter": f"{iteration}.{bg['poll_count']}",
@@ -3927,6 +5520,17 @@ def _run_monitor_loop(bg: dict, goal: str, workdir: str, eval_model: str | None,
             "feedback": feedback,
             "full_msg": eval_msg,
             "type": "monitor",
+            "meta": eval_payload,
+        })
+        _append_memory_event(goal, {
+            "event_type": "monitor_decision",
+            "iter": f"{iteration}.{bg['poll_count']}",
+            "decision": decision,
+            "reason_type": eval_payload["reason_type"],
+            "next_action": eval_payload["next_action"],
+            "confidence": eval_payload["confidence"],
+            "needs_long_run_monitor": eval_payload["needs_long_run_monitor"],
+            "summary": eval_payload["summary"],
         })
         worker_buf.append(
             f"[cyan]Monitor #{bg['poll_count']}: {decision}"
@@ -3980,6 +5584,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
     history = list(initial_history or [])
     eval_history = list(initial_eval_history or [])
     worker_buf = deque(maxlen=WORKER_BUF_LINES)
+    worker_spoken = [""]
     worker_status = ["idle"]
     done = False
     bg_train: dict | None = None   # 백그라운드 학습 job 추적
@@ -3994,9 +5599,7 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
     ab_cooldown = 0                # A/B 직후 N회는 정체 감지 억제
     _session_start = time.time()   # 세션 시작 시각
 
-    # 모드별 시스템 프롬프트 및 도구 선택
-    worker_sys   = RESEARCH_WORKER_SYSTEM if mode == "research" else WORKER_SYSTEM
-    eval_sys     = RESEARCH_EVALUATOR_SYSTEM if mode == "research" else EVALUATOR_SYSTEM
+    # 모드별 도구 선택
     base_tools   = RESEARCH_TOOLS if mode == "research" else WORKER_TOOLS
     active_tools = base_tools + ([] if _IS_SSH else _mcp_all_tools())
 
@@ -4036,7 +5639,8 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
         layout["evaluator"].update(render_evaluator_panel(
             eval_history, iteration, phase, done))
         layout["cmd_bar"].update(
-            render_cmd_bar(worker_buf, deque(), worker_status[0], "idle")
+            render_cmd_bar(worker_buf, deque(), worker_status[0], "idle",
+                           worker_spoken[0], "")
         )
 
     for iteration in range(1, max_iter + 1):
@@ -4044,8 +5648,12 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
         _dbg("LOOP", f"ITER_START  iteration={iteration}")
         _iter_t0 = time.time()
         # ── END DEBUG ────────────────────────────────────────────────────
+        policy_profile = _detect_task_profile(goal, mode=mode, history=history)
+        worker_sys = _compose_worker_system(policy_profile)
+        eval_sys = _compose_evaluator_system(policy_profile)
         # ── Worker ──────────────────────────────────────────────────────
         worker_buf.clear()
+        worker_spoken[0] = ""
         worker_status[0] = "running"
         if not live._started:
             live.start()
@@ -4076,6 +5684,8 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                 eval_model, past_attempts,
                 worker_buf, iteration, refresh,
                 code_only=always_ab,
+                policy_profile=policy_profile,
+                last_spoken_ref=worker_spoken,
             )
             if ab_chosen == "interrupted":
                 live.stop()
@@ -4094,7 +5704,8 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                 refresh("worker", iteration)
                 train_prompt = (
                     build_worker_prompt(goal, history, past_attempts=past_attempts,
-                                        session_context=session_context)
+                                        session_context=session_context,
+                                        policy_profile=policy_profile)
                     + f"\n\n[ONE_DUAL] 전략 {ab_chosen}의 코드가 workdir에 적용되었습니다. "
                       "학습 스크립트를 background에서 실행하고 PID와 로그 경로를 보고하라. "
                       "코드를 추가로 수정하지 마라."
@@ -4104,7 +5715,9 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                 def _train_worker():
                     train_result[0], _ = run_worker(
                         train_prompt, workdir, worker_model, worker_buf, worker_status,
-                        system_prompt=worker_sys, tools=active_tools)
+                        system_prompt=worker_sys, tools=active_tools,
+                        goal_context=goal, iteration_id=iteration,
+                        last_spoken_ref=worker_spoken)
 
                 t_train = threading.Thread(target=_train_worker, daemon=True)
                 t_train.start()
@@ -4128,13 +5741,16 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                 # 최대 재시도 초과 → 일반 워커로 fallback (아래 else 블록과 동일 로직)
                 ab_chosen = None
                 worker_prompt = build_worker_prompt(goal, history, past_attempts=past_attempts,
-                                                    session_context=session_context)
+                                                    session_context=session_context,
+                                                    policy_profile=policy_profile)
                 worker_result = [None, None]
 
                 def _worker_np():
                     worker_result[0], worker_result[1] = run_worker(
                         worker_prompt, workdir, worker_model, worker_buf, worker_status,
-                        system_prompt=worker_sys, tools=active_tools)
+                        system_prompt=worker_sys, tools=active_tools,
+                        goal_context=goal, iteration_id=iteration,
+                        last_spoken_ref=worker_spoken)
 
                 t_np = threading.Thread(target=_worker_np, daemon=True)
                 t_np.start()
@@ -4159,13 +5775,16 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
         else:
             # 일반 Worker 실행
             worker_prompt = build_worker_prompt(goal, history, past_attempts=past_attempts,
-                                                session_context=session_context)
+                                                session_context=session_context,
+                                                policy_profile=policy_profile)
             worker_result = [None, None]
 
             def _worker():
                 worker_result[0], worker_result[1] = run_worker(
                     worker_prompt, workdir, worker_model, worker_buf, worker_status,
-                    system_prompt=worker_sys, tools=active_tools)
+                    system_prompt=worker_sys, tools=active_tools,
+                    goal_context=goal, iteration_id=iteration,
+                    last_spoken_ref=worker_spoken)
 
             t = threading.Thread(target=_worker, daemon=True)
             t.start()
@@ -4190,12 +5809,18 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
         last_msg_str = last_msg or ""
         worker_summary = last_msg_str.replace('\n', ' ')[:300]
         hypothesis = _extract_hypothesis(last_msg_str)
+        changed_files = _collect_changed_files(workdir)
+        attempt_signals = _classify_attempt_signals(last_msg_str, worker_summary, changed_files)
         history.append({
             'iter': iteration,
             'worker_summary': worker_summary,
             'worker_lines': list(worker_buf)[-12:],
             'decision': '',
             'feedback': '',
+            'changed_files': changed_files,
+            'attempt_signals': attempt_signals,
+            'policy_labels': list(policy_profile.get("labels", [])),
+            'eval_meta': {},
             **({"ab_chosen": ab_chosen} if ab_chosen else {}),
         })
 
@@ -4305,35 +5930,72 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
             _persist_session(_last_session)
             return _finish('interrupted')
 
-        if iteration % eval_every == 0 or iteration == max_iter:
+        preemptive_payload = _preemptive_eval_override(history, last_msg_str, worker_summary, changed_files)
+        if preemptive_payload is not None:
+            eval_payload = preemptive_payload
+            eval_msg = json.dumps(
+                {k: v for k, v in eval_payload.items() if k != "raw_text"},
+                ensure_ascii=False,
+            )
+        elif iteration % eval_every == 0 or iteration == max_iter:
             refresh("evaluator", iteration)
             eval_prompt = build_evaluator_prompt(goal, last_msg or "", iteration, workdir,
                                                  past_attempts=past_attempts,
-                                                 history=history)
+                                                 history=history,
+                                                 policy_profile=policy_profile)
             eval_msg, _ = run_evaluator(eval_prompt, workdir, eval_model,
-                                        system_prompt=eval_sys)
+                                        system_prompt=eval_sys,
+                                        output_schema=_FAST_EVALUATOR_OUTPUT_SCHEMA,
+                                        retry_invalid_json=True)
+            eval_payload = _normalize_evaluator_payload(eval_msg)
         else:
-            eval_msg = "IMPROVE: (evaluation skipped)"
+            eval_payload = {
+                "decision": "IMPROVE",
+                "reason_type": "monitoring",
+                "next_action": "(evaluation skipped for this iteration)",
+                "confidence": 0.5,
+                "rollback_needed": False,
+                "needs_search": False,
+                "needs_long_run_monitor": False,
+                "summary": {
+                    "judgment": "",
+                    "result_paths": [],
+                    "result_summary": "",
+                },
+            }
+            eval_msg = json.dumps(eval_payload, ensure_ascii=False)
 
-        decision, feedback = parse_decision(eval_msg)
+        eval_payload = _apply_eval_policy_overrides(
+            history,
+            eval_payload,
+            last_msg_str,
+            worker_summary,
+            changed_files,
+        )
+        eval_msg = json.dumps(
+            {k: v for k, v in eval_payload.items() if k != "raw_text"},
+            ensure_ascii=False,
+        )
+        decision = eval_payload["decision"]
+        feedback = _decision_feedback_from_payload(eval_payload)
         history[-1]['decision'] = decision
         history[-1]['feedback'] = feedback
+        history[-1]['eval_meta'] = eval_payload
         eval_history.append({
             'iter': iteration,
             'decision': decision,
             'feedback': feedback,
             'full_msg': eval_msg,
+            'meta': eval_payload,
         })
 
         # ── 체크포인트 처리 ───────────────────────────────────────────────
-        if decision == 'REDIRECT' and cp_before is not None:
-            # REDIRECT: 이번 iteration 변경사항 롤백
+        if eval_payload['rollback_needed'] and cp_before is not None:
             restored = _cp_restore(workdir, cp_before)
             if restored:
-                worker_buf.append("[yellow]↩ REDIRECT — 변경사항 롤백됨[/yellow]")
+                worker_buf.append("[yellow]↩ 평가자 요청에 따라 변경사항 롤백됨[/yellow]")
             _cp_delete(cp_before)
         else:
-            # DONE/IMPROVE: 변경사항 유지, 체크포인트 파일만 삭제
             _cp_delete(cp_before)
 
         # ── 지식 저장소에 attempt 기록 ───────────────────────────────────
@@ -4345,10 +6007,56 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
             "worker_summary": worker_summary,
             "hypothesis": hypothesis,
             "goal": goal,
+            "reason_type": eval_payload["reason_type"],
+            "next_action": eval_payload["next_action"],
+            "confidence": eval_payload["confidence"],
+            "rollback_needed": eval_payload["rollback_needed"],
+            "needs_search": eval_payload["needs_search"],
+            "needs_long_run_monitor": eval_payload["needs_long_run_monitor"],
+            "changed_files": changed_files,
+            "attempt_signals": attempt_signals,
+            "summary": eval_payload["summary"],
         }
         _save_attempt(goal, attempt_record)
         past_attempts.append(attempt_record)  # 현재 세션 내 즉시 반영
         _write_report_entry(goal, iteration, decision, feedback, worker_summary, hypothesis)
+        _append_memory_event(goal, {
+            "event_type": "decision",
+            "iter": iteration,
+            "decision": decision,
+            "reason_type": eval_payload["reason_type"],
+            "next_action": eval_payload["next_action"],
+            "confidence": eval_payload["confidence"],
+            "rollback_needed": eval_payload["rollback_needed"],
+            "needs_search": eval_payload["needs_search"],
+            "needs_long_run_monitor": eval_payload["needs_long_run_monitor"],
+            "worker_summary": worker_summary,
+            "hypothesis": hypothesis,
+            "changed_files": changed_files,
+            "attempt_signals": attempt_signals,
+            "summary": eval_payload["summary"],
+        })
+        for path in changed_files:
+            _append_memory_event(goal, {
+                "event_type": "file_change",
+                "iter": iteration,
+                "path": path,
+                "decision": decision,
+                "rolled_back": eval_payload["rollback_needed"],
+            })
+        for metric in _extract_metric_events(last_msg_str):
+            _append_memory_event(goal, {
+                "event_type": "metric",
+                "iter": iteration,
+                **metric,
+            })
+        for artifact_path in eval_payload["summary"].get("result_paths", []):
+            _append_memory_event(goal, {
+                "event_type": "artifact",
+                "iter": iteration,
+                "artifact_path": artifact_path,
+                "decision": decision,
+            })
 
         # ── 이전 압축 결과 반영 ──────────────────────────────────────────
         if _compress_thread and not _compress_thread.is_alive() and _compress_result:
@@ -4357,7 +6065,12 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
             _compress_thread = None
 
         # ── 프롬프트 토큰이 100k 초과 시 백그라운드 압축 시작 ────────────
-        prompt_tokens = _estimate_tokens(build_worker_prompt(goal, history, past_attempts=past_attempts))
+        prompt_tokens = _estimate_tokens(build_worker_prompt(
+            goal,
+            history,
+            past_attempts=past_attempts,
+            policy_profile=policy_profile,
+        ))
         if (prompt_tokens > TOKEN_COMPRESS_THRESHOLD
                 and (_compress_thread is None or not _compress_thread.is_alive())
                 and decision != 'DONE'):
@@ -4368,6 +6081,16 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                 new_h = compress_history(_snap, goal, eval_model)
                 _res.clear()
                 _res.append(new_h)
+                if len(new_h) < len(_snap):
+                    _append_memory_event(goal, {
+                        "event_type": "history_compression",
+                        "iter": iteration,
+                        "summary": {
+                            "judgment": f"Compressed history from {len(_snap)} to {len(new_h)} entries.",
+                            "result_paths": [],
+                            "result_summary": "Older iterations were summarized to control prompt size.",
+                        },
+                    })
 
             _compress_thread = threading.Thread(target=_do_compress, daemon=True)
             _compress_thread.start()
@@ -4389,8 +6112,9 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
             console.print()
 
             # Q&A / 조회 작업: 결과물 위치가 없으면 worker 답변을 직접 출력
-            _loc_m = re.search(r'결과물 위치:\s*(.+?)(?=\n판단|결과물|결과 요약|\Z)', eval_msg, re.S)
-            _loc_val = _loc_m.group(1).strip() if _loc_m else ""
+            done_summary = eval_payload.get("summary", {})
+            result_paths = done_summary.get("result_paths", [])
+            _loc_val = ", ".join(result_paths)
             _no_file = (not _loc_val or
                         _loc_val.lower().startswith(('없음', '해당 없음', 'n/a', 'none', '-')) or
                         not any(c in _loc_val for c in ('/', '\\', '.')))
@@ -4406,14 +6130,19 @@ def run_agent_loop(goal: str, workdir: str, worker_model: str | None,
                 console.print("[dim]  /last 로 언제든 다시 볼 수 있습니다[/dim]")
                 console.print()
 
-            for section, color in [('판단 이유', 'white'), ('결과물 위치', 'cyan'), ('결과 요약', 'bright_white')]:
-                m = re.search(rf'{section}:\s*(.+?)(?=\n판단|결과물|결과 요약|\Z)', eval_msg, re.S)
-                if m:
-                    val = m.group(1).strip()
-                    console.print(f"[bold]{section}[/bold]")
-                    for line in val.splitlines():
-                        console.print(f"  [{color}]{line}[/{color}]")
-                    console.print()
+            summary_sections = [
+                ("판단 이유", done_summary.get("judgment", ""), 'white'),
+                ("결과물 위치", "\n".join(result_paths), 'cyan'),
+                ("결과 요약", done_summary.get("result_summary", ""), 'bright_white'),
+            ]
+            for section, value, color in summary_sections:
+                value = (value or "").strip()
+                if not value:
+                    continue
+                console.print(f"[bold]{section}[/bold]")
+                for line in value.splitlines():
+                    console.print(f"  [{color}]{line}[/{color}]")
+                console.print()
             # 실험 결과 자동 시각화
             plots = _try_visualize(workdir, goal)
             if plots:
@@ -4458,6 +6187,8 @@ def run_dual_agent_loop(
     eval_history2 = list(initial_eval_history2 or [])
     buf1 = deque(maxlen=WORKER_BUF_LINES)
     buf2 = deque(maxlen=WORKER_BUF_LINES)
+    spoken1 = [""]
+    spoken2 = [""]
     status1 = ["idle"]
     status2 = ["idle"]
     _session_start = time.time()   # 세션 시작 시각
@@ -4466,7 +6197,8 @@ def run_dual_agent_loop(
     current_task_a = task_a
     current_task_b = task_b
 
-    worker_sys = RESEARCH_WORKER_SYSTEM if mode == "research" else WORKER_SYSTEM
+    policy_profile = _detect_task_profile(goal, mode=mode)
+    worker_sys = _compose_worker_system(policy_profile)
     active_tools = (RESEARCH_TOOLS if mode == "research" else WORKER_TOOLS) + ([] if _IS_SSH else _mcp_all_tools())
 
     past_attempts1 = _load_past_attempts(task_a)
@@ -4520,7 +6252,7 @@ def run_dual_agent_loop(
             render_dual_evaluator_panel(eval_history1, eval_history2, iteration, phase, done1, done2)
         )
         layout["cmd_bar"].update(
-            render_cmd_bar(buf1, buf2, status1[0], status2[0])
+            render_cmd_bar(buf1, buf2, status1[0], status2[0], spoken1[0], spoken2[0])
         )
 
     # 이전 레이아웃 잔상 제거 후 즉시 듀얼 레이아웃 시작
@@ -4540,6 +6272,8 @@ def run_dual_agent_loop(
         # ── Phase 1: Workers 병렬 실행 ───────────────────────────────────
         buf1.clear()
         buf2.clear()
+        spoken1[0] = ""
+        spoken2[0] = ""
         if not done1:
             status1[0] = "running"
         if not done2:
@@ -4554,19 +6288,25 @@ def run_dual_agent_loop(
             if done1:
                 return
             prompt = build_worker_prompt(current_task_a, history1, past_attempts=past_attempts1,
-                                         session_context=session_context)
+                                         session_context=session_context,
+                                         policy_profile=policy_profile)
             w1_result[0], w1_result[1] = run_worker(
                 prompt, workdir, worker_model, buf1, status1,
-                system_prompt=worker_sys, tools=active_tools, worker_id=1)
+                system_prompt=worker_sys, tools=active_tools, worker_id=1,
+                goal_context=current_task_a, iteration_id=iteration,
+                last_spoken_ref=spoken1)
 
         def _w2():
             if done2:
                 return
             prompt = build_worker_prompt(current_task_b, history2, past_attempts=past_attempts2,
-                                         session_context=session_context)
+                                         session_context=session_context,
+                                         policy_profile=policy_profile)
             w2_result[0], w2_result[1] = run_worker(
                 prompt, workdir, worker_model, buf2, status2,
-                system_prompt=worker_sys, tools=active_tools, worker_id=2)
+                system_prompt=worker_sys, tools=active_tools, worker_id=2,
+                goal_context=current_task_b, iteration_id=iteration,
+                last_spoken_ref=spoken2)
 
         t1 = threading.Thread(target=_w1, daemon=True)
         t2 = threading.Thread(target=_w2, daemon=True)
@@ -4619,17 +6359,25 @@ def run_dual_agent_loop(
             if done1:
                 return
             ep = build_evaluator_prompt(current_task_a, msg1, iteration, workdir,
-                                        past_attempts=past_attempts1, history=history1)
+                                        past_attempts=past_attempts1, history=history1,
+                                        policy_profile=policy_profile)
             eval1_result[0], eval1_result[1] = run_evaluator(
-                ep, workdir, eval_model, system_prompt=DUAL_EVALUATOR_SYSTEM)
+                ep, workdir, eval_model,
+                system_prompt=_compose_dual_evaluator_system(policy_profile),
+                output_schema=_FAST_EVALUATOR_OUTPUT_SCHEMA,
+                retry_invalid_json=True)
 
         def _e2():
             if done2:
                 return
             ep = build_evaluator_prompt(current_task_b, msg2, iteration, workdir,
-                                        past_attempts=past_attempts2, history=history2)
+                                        past_attempts=past_attempts2, history=history2,
+                                        policy_profile=policy_profile)
             eval2_result[0], eval2_result[1] = run_evaluator(
-                ep, workdir, eval_model, system_prompt=DUAL_EVALUATOR_SYSTEM)
+                ep, workdir, eval_model,
+                system_prompt=_compose_dual_evaluator_system(policy_profile),
+                output_schema=_FAST_EVALUATOR_OUTPUT_SCHEMA,
+                retry_invalid_json=True)
 
         et1 = threading.Thread(target=_e1, daemon=True)
         et2 = threading.Thread(target=_e2, daemon=True)
@@ -4655,25 +6403,56 @@ def run_dual_agent_loop(
             return _finish('interrupted')
 
         # ── Phase 3: Decision 처리 ────────────────────────────────────────
-        eval_msg1 = eval1_result[0] or "IMPROVE: (no response)" if not done1 else ""
-        eval_msg2 = eval2_result[0] or "IMPROVE: (no response)" if not done2 else ""
+        eval_msg1 = eval1_result[0] or json.dumps({
+            "decision": "IMPROVE",
+            "reason_type": "other",
+            "next_action": "(no response)",
+            "confidence": 0.5,
+            "rollback_needed": False,
+            "needs_search": False,
+            "needs_long_run_monitor": False,
+            "summary": {"judgment": "", "result_paths": [], "result_summary": ""},
+        }, ensure_ascii=False) if not done1 else ""
+        eval_msg2 = eval2_result[0] or json.dumps({
+            "decision": "IMPROVE",
+            "reason_type": "other",
+            "next_action": "(no response)",
+            "confidence": 0.5,
+            "rollback_needed": False,
+            "needs_search": False,
+            "needs_long_run_monitor": False,
+            "summary": {"judgment": "", "result_paths": [], "result_summary": ""},
+        }, ensure_ascii=False) if not done2 else ""
 
-        decision1, feedback1 = parse_decision(eval_msg1) if not done1 else ("DONE", "")
-        decision2, feedback2 = parse_decision(eval_msg2) if not done2 else ("DONE", "")
+        payload1 = _normalize_evaluator_payload(
+            eval_msg1, allow=("CONTINUE", "IMPROVE", "REDIRECT", "DONE", "GPU_PICK")
+        ) if not done1 else {"decision": "DONE", "next_action": ""}
+        payload2 = _normalize_evaluator_payload(
+            eval_msg2, allow=("CONTINUE", "IMPROVE", "REDIRECT", "DONE", "GPU_PICK")
+        ) if not done2 else {"decision": "DONE", "next_action": ""}
+
+        decision1 = payload1["decision"] if not done1 else "DONE"
+        decision2 = payload2["decision"] if not done2 else "DONE"
+        feedback1 = _decision_feedback_from_payload(payload1) if not done1 else ""
+        feedback2 = _decision_feedback_from_payload(payload2) if not done2 else ""
 
         if not done1:
             history1[-1]['decision'] = decision1
             history1[-1]['feedback'] = feedback1
+            history1[-1]['eval_meta'] = payload1
             eval_history1.append({
                 'iter': iteration, 'decision': decision1,
                 'feedback': feedback1, 'full_msg': eval_msg1,
+                'meta': payload1,
             })
         if not done2:
             history2[-1]['decision'] = decision2
             history2[-1]['feedback'] = feedback2
+            history2[-1]['eval_meta'] = payload2
             eval_history2.append({
                 'iter': iteration, 'decision': decision2,
                 'feedback': feedback2, 'full_msg': eval_msg2,
+                'meta': payload2,
             })
 
         refresh("dual_evaluator", iteration)
@@ -4721,16 +6500,24 @@ def run_dual_agent_loop(
                     )
                     override_eval_msg, _ = run_evaluator(
                         override_prompt, workdir, eval_model,
-                        system_prompt=DUAL_EVALUATOR_SYSTEM)
-                    ov_decision, ov_feedback = parse_decision(override_eval_msg)
+                        system_prompt=_compose_dual_evaluator_system(policy_profile),
+                        output_schema=_FAST_EVALUATOR_OUTPUT_SCHEMA,
+                        retry_invalid_json=True)
+                    override_payload = _normalize_evaluator_payload(
+                        override_eval_msg, allow=("IMPROVE", "REDIRECT", "DONE", "GPU_PICK", "CONTINUE")
+                    )
+                    ov_decision = override_payload["decision"]
+                    ov_feedback = _decision_feedback_from_payload(override_payload)
                     target_hist = history2 if rw == 2 else history1
                     if target_hist:
                         target_hist[-1]['decision'] = ov_decision
                         target_hist[-1]['feedback'] = ov_feedback
+                        target_hist[-1]['eval_meta'] = override_payload
                     target_eval_hist = eval_history2 if rw == 2 else eval_history1
                     target_eval_hist.append({
                         'iter': iteration, 'decision': ov_decision,
                         'feedback': ov_feedback, 'full_msg': override_eval_msg,
+                        'meta': override_payload,
                     })
                 else:
                     live.start()
@@ -4773,12 +6560,20 @@ def run_dual_agent_loop(
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "iter": iteration, "decision": decision1, "feedback": feedback1,
                 "worker_summary": summary1, "goal": current_task_a,
+                "reason_type": payload1.get("reason_type", "") if not done1 else "",
+                "next_action": payload1.get("next_action", "") if not done1 else "",
+                "confidence": payload1.get("confidence", 0.5) if not done1 else 0.5,
+                "rollback_needed": payload1.get("rollback_needed", False) if not done1 else False,
             })
         if not done2 or history2 and history2[-1].get('decision'):
             _save_attempt(current_task_b, {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "iter": iteration, "decision": decision2, "feedback": feedback2,
                 "worker_summary": summary2, "goal": current_task_b,
+                "reason_type": payload2.get("reason_type", "") if not done2 else "",
+                "next_action": payload2.get("next_action", "") if not done2 else "",
+                "confidence": payload2.get("confidence", 0.5) if not done2 else 0.5,
+                "rollback_needed": payload2.get("rollback_needed", False) if not done2 else False,
             })
 
         _persist_dual()
@@ -4815,7 +6610,7 @@ def _prepare_single_shell(
     layout["evaluator"].update(render_evaluator_panel(
         eval_history or [], iteration, "idle", False
     ))
-    layout["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
+    layout["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle", "", ""))
     return layout, ui.create_live_proxy()
 
 
@@ -4843,7 +6638,7 @@ def _prepare_dual_shell(
     layout["evaluator"].update(render_dual_evaluator_panel(
         eval_history1 or [], eval_history2 or [], iteration, "idle", False, False
     ))
-    layout["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle"))
+    layout["cmd_bar"].update(render_cmd_bar(deque(), deque(), "idle", "idle", "", ""))
     return layout, ui.create_live_proxy()
 
 
@@ -4894,6 +6689,34 @@ def _interactive_controller(args, workdir: str, max_iter: int, ui: InteractiveSh
     eval_every = args.eval_every
     current_goal = ""
     _session_summaries: list[dict] = []
+    def _fast_mode_label() -> str:
+        requested = bool(ui.fast_mode)
+        if requested and _get_codex_bin() is not None:
+            return "[green]on[/green]"
+        if requested:
+            return "[yellow]requested (codex missing)[/yellow]"
+        return "[dim]off[/dim]"
+
+    def _apply_fast_mode(enabled: bool, announce: bool = False) -> bool:
+        requested = bool(enabled)
+        codex_bin = _refresh_codex_bin() if requested else _get_codex_bin()
+        if requested and codex_bin is None:
+            ui.set_fast_mode(False)
+            _set_fast_mode(False)
+            if announce:
+                console.print(f"[red]/fast on 실패: codex 실행 파일이 없습니다 ({_codex_display_path()}).[/red]")
+            return False
+        ui.set_fast_mode(requested)
+        _set_fast_mode(requested)
+        _append_session_event("fast_mode", enabled=requested)
+        if announce:
+            console.print(
+                f"[cyan]Fast transport: {'on' if requested else 'off'}[/cyan]  "
+                f"[dim]({'official codex exec' if requested else 'legacy backend'})[/dim]"
+            )
+        return True
+
+    _apply_fast_mode(bool(ui.fast_mode))
 
     def _record_session_summary(outcome: str, fallback_goal: str) -> None:
         if outcome == "interrupted" or not _last_session:
@@ -5092,7 +6915,7 @@ def _interactive_controller(args, workdir: str, max_iter: int, ui: InteractiveSh
 
     console.print(
         f"[dim]명령을 입력하세요. /help 로 커맨드 목록 확인. "
-        f"모드: {current_mode}[/dim]"
+        f"모드: {current_mode}  |  fast: {'on' if ui.fast_mode else 'off'}[/dim]"
     )
 
     try:
@@ -5117,6 +6940,21 @@ def _interactive_controller(args, workdir: str, max_iter: int, ui: InteractiveSh
 
                 if cmd_name == "resume":
                     _resume_saved_session()
+                    continue
+
+                if cmd_name == "fast":
+                    arg = cmd_arg.strip().lower()
+                    if arg in ("", "status"):
+                        console.print(
+                            f"fast transport: {_fast_mode_label()}  "
+                            f"[dim]({'official codex exec' if ui.fast_mode else 'legacy backend'})[/dim]"
+                        )
+                    elif arg == "on":
+                        _apply_fast_mode(True, announce=True)
+                    elif arg == "off":
+                        _apply_fast_mode(False, announce=True)
+                    else:
+                        console.print("[red]/fast on|off|status[/red]")
                     continue
 
                 if cmd_name == "mode":
@@ -5170,6 +7008,7 @@ def _interactive_controller(args, workdir: str, max_iter: int, ui: InteractiveSh
                         f"모드: [cyan]{current_mode}[/cyan]  |  "
                         f"eval-every: [cyan]{eval_every}[/cyan]  |  "
                         f"dir: [cyan]{workdir}[/cyan]  |  "
+                        f"fast: {_fast_mode_label()}  |  "
                         f"wandb: {wandb_str}"
                     )
                     continue
@@ -5361,8 +7200,8 @@ def main():
     args = parser.parse_args(cli_args)
 
     if args.subcommand == "auth":
-        if not CODEX_BIN.exists():
-            console.print(f"[red]Error: codex not found at {CODEX_BIN}[/red]")
+        if _refresh_codex_bin() is None:
+            console.print(f"[red]Error: codex not found at {_codex_display_path()}[/red]")
             sys.exit(1)
         if args.auth_cmd == "login":
             cmd_auth_login(device=getattr(args, "device", False))
