@@ -6,3 +6,14 @@ build/
 .env
 .DS_Store
 *.log
+/.bench_runs/
+/.bench_hidden/
+/.codex_bench_runs/
+/.codex_bench_hidden/
+/benchmarks/results/
+/benchmarks/tmp_*.json
+/benchmarks/*_dry.json
+/benchmarks/*_smoke.json
+/benchmarks/af_*.json
+/benchmarks/codex_*.json
+/benchmarks/results_*.json

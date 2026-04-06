@@ -1,0 +1,62 @@
+[
+  {
+    "id": "config-loader-invalid-env",
+    "goal": "config_loader.py의 load_config를 수정해 APP_DEBUG와 APP_RETRIES 환경변수 override를 지원하고 public/hidden tests를 모두 통과하게 만들어라.",
+    "init_git": true,
+    "repeats": 2,
+    "files": {
+      "config_loader.py": "def load_config(env):\n    return {\n        'debug': False,\n        'retries': 3,\n    }\n",
+      "test_config_loader_public.py": "from config_loader import load_config\n\nassert load_config({}) == {'debug': False, 'retries': 3}\nassert load_config({'APP_DEBUG': 'true', 'APP_RETRIES': '5'}) == {'debug': True, 'retries': 5}\nassert load_config({'APP_DEBUG': '0'}) == {'debug': False, 'retries': 3}\nprint('ok')\n"
+    },
+    "public_verify": "python test_config_loader_public.py",
+    "hidden_files": {
+      "hidden_test_config_loader.py": "@file:hidden/quality/hidden_test_config_loader.py"
+    },
+    "hidden_verify": "python {hidden_dir}/hidden_test_config_loader.py",
+    "expected_changed_files": [
+      "config_loader.py"
+    ],
+    "target_duration_seconds": 45,
+    "target_tool_calls": 6
+  },
+  {
+    "id": "report-summary-regression",
+    "goal": "report.py의 summarize_orders를 고쳐 public/hidden tests를 모두 통과하게 만들어라. 불필요한 변경은 하지 마라.",
+    "init_git": true,
+    "repeats": 2,
+    "files": {
+      "report.py": "def summarize_orders(orders):\n    total = 0\n    paid_count = 0\n    pending_ids = []\n    for order in orders:\n        total += 1\n        if order['status'] == 'paid':\n            paid_count += order['amount']\n        if order['status'] == 'pending':\n            pending_ids.append(order['status'])\n    return {\n        'total_amount': total,\n        'paid_count': paid_count,\n        'pending_ids': pending_ids,\n    }\n",
+      "test_report_public.py": "from report import summarize_orders\n\norders = [\n    {'id': 'o1', 'amount': 10, 'status': 'paid'},\n    {'id': 'o2', 'amount': 25, 'status': 'pending'},\n    {'id': 'o3', 'amount': 5, 'status': 'paid'},\n]\nassert summarize_orders(orders) == {'total_amount': 40, 'paid_count': 2, 'pending_ids': ['o2']}\nprint('ok')\n"
+    },
+    "public_verify": "python test_report_public.py",
+    "hidden_files": {
+      "hidden_test_report.py": "@file:hidden/quality/hidden_test_report.py"
+    },
+    "hidden_verify": "python {hidden_dir}/hidden_test_report.py",
+    "expected_changed_files": [
+      "report.py"
+    ],
+    "target_duration_seconds": 45,
+    "target_tool_calls": 6
+  },
+  {
+    "id": "slugify-edge-cases",
+    "goal": "utils.py의 slugify 함수를 구현해 public/hidden tests를 모두 통과하게 만들어라. 소문자화하고 비영숫자 연속 구간은 단일 하이픈으로 치환하라.",
+    "init_git": true,
+    "repeats": 2,
+    "files": {
+      "utils.py": "import re\n\ndef slugify(text: str) -> str:\n    raise NotImplementedError('TODO')\n",
+      "test_slugify_public.py": "from utils import slugify\n\nassert slugify('Hello World') == 'hello-world'\nassert slugify('  Multiple   Spaces ') == 'multiple-spaces'\nassert slugify('API__Version!!2') == 'api-version-2'\nprint('ok')\n"
+    },
+    "public_verify": "python test_slugify_public.py",
+    "hidden_files": {
+      "hidden_test_slugify.py": "@file:hidden/quality/hidden_test_slugify.py"
+    },
+    "hidden_verify": "python {hidden_dir}/hidden_test_slugify.py",
+    "expected_changed_files": [
+      "utils.py"
+    ],
+    "target_duration_seconds": 45,
+    "target_tool_calls": 6
+  }
+]

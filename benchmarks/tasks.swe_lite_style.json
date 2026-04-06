@@ -1,0 +1,34 @@
+[
+  {
+    "id": "inventory-low-stock",
+    "issue_statement": "The low stock report in inventory.service.low_stock_skus is wrong. Product wants only SKUs with stock strictly below the threshold. Archived items must never appear in the result, and the result order should match the incoming item order instead of being sorted alphabetically. Please fix the bug without changing the public API.",
+    "template_dir": "templates/swe_lite/inventory-low-stock",
+    "init_git": true,
+    "public_verify": "python tests/test_public.py",
+    "hidden_files": {
+      "test_hidden.py": "@file:hidden/swe_lite/inventory_low_stock_hidden.py"
+    },
+    "hidden_verify": "python {hidden_dir}/test_hidden.py",
+    "expected_changed_files": [
+      "src/inventory/service.py"
+    ],
+    "target_duration_seconds": 60,
+    "target_tool_calls": 8
+  },
+  {
+    "id": "billing-discount-order",
+    "issue_statement": "invoice_total in billing.calc is calculating the invoice in the wrong order. The fixed discount must be subtracted before tax is applied. We also do not want negative totals when the discount is larger than the subtotal. Keep the same function signature and return a rounded float.",
+    "template_dir": "templates/swe_lite/billing-discount-order",
+    "init_git": true,
+    "public_verify": "python tests/test_public.py",
+    "hidden_files": {
+      "test_hidden.py": "@file:hidden/swe_lite/billing_discount_hidden.py"
+    },
+    "hidden_verify": "python {hidden_dir}/test_hidden.py",
+    "expected_changed_files": [
+      "src/billing/calc.py"
+    ],
+    "target_duration_seconds": 60,
+    "target_tool_calls": 8
+  }
+]
